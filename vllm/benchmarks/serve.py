@@ -37,6 +37,7 @@ from typing import Any, Literal
 
 import aiohttp
 import numpy as np
+from loguru import logger
 from tqdm.asyncio import tqdm
 
 from vllm.benchmarks.datasets import SampleRequest, add_dataset_parser, get_samples
@@ -1123,6 +1124,256 @@ def parse_goodput(slo_pairs):
     return goodput_config_dict
 
 
+# ---------------------------------------------------------------------------
+# OpenOpenRec two-stage benchmark
+# ---------------------------------------------------------------------------
+
+
+async def benchmark_openopenrec_two_stage(
+    *,
+    # common args forwarded to benchmark()
+    task_type: "TaskType",
+    endpoint_type: str,
+    base_url: str,
+    model_id: str,
+    model_name: str,
+    tokenizer: "TokenizerLike",
+    input_requests: list[SampleRequest],
+    logprobs: int | None,
+    request_rate: float,
+    burstiness: float,
+    disable_tqdm: bool,
+    num_warmups: int,
+    profile: bool,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    ignore_eos: bool,
+    goodput_config_dict: dict[str, float],
+    max_concurrency: int | None,
+    lora_modules: Iterable[str] | None,
+    extra_headers: dict | None,
+    ramp_up_strategy: Literal["linear", "exponential"] | None,
+    ramp_up_start_rps: int | None,
+    ramp_up_end_rps: int | None,
+    ready_check_timeout_sec: int,
+    # two-stage specific
+    prompt_token: str,
+    num_beams: int,
+    max_new_tokens: int,
+    max_thinking_tokens: int,
+    num_return_thinking: int,
+    thinking_temperature: float,
+    thinking_top_p: float,
+    thinking_top_k: int,
+) -> dict[str, Any]:
+    """Run the OpenOneRec two-stage benchmark.
+
+    Stage 1 – thinking (sampling, stop at ``</think>``).
+    Stage 2 – beam search with *prompt_token* appended after thinking.
+
+    Each stage delegates to :func:`benchmark` so that the standard vLLM
+    serving metrics are collected and printed.
+    """
+
+    host_port = base_url.split("//", 1)[-1]  # strip scheme
+    api_url_completions = f"{base_url}/v1/completions"
+
+    # ------------------------------------------------------------------ #
+    # Stage 1 – thinking                                                  #
+    # ------------------------------------------------------------------ #
+    stage1_extra_body: dict[str, Any] = {
+        "stop": ["</think>"],
+        "n": num_return_thinking,
+        "temperature": thinking_temperature,
+        "top_p": thinking_top_p,
+    }
+    if thinking_top_k > 0:
+        stage1_extra_body["top_k"] = thinking_top_k
+
+    stage1_requests = [
+        SampleRequest(
+            prompt=r.prompt,
+            prompt_len=r.prompt_len,
+            expected_output_len=max_thinking_tokens,
+            multi_modal_data=r.multi_modal_data,
+            lora_request=r.lora_request,
+            request_id=r.request_id,
+        )
+        for r in input_requests
+    ]
+
+    logger.info(
+        "===== OpenOpenRec Stage 1/2: Thinking (sampling) ====="
+    )
+    logger.info(
+        "  n={}, max_tokens={}, temp={}, top_p={}, top_k={}, stop=['</think>']",
+        num_return_thinking, max_thinking_tokens,
+        thinking_temperature, thinking_top_p, thinking_top_k,
+    )
+
+    stage1_result = await benchmark(
+        task_type=task_type,
+        endpoint_type="openai",
+        api_url=api_url_completions,
+        base_url=base_url,
+        model_id=model_id,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        input_requests=stage1_requests,
+        logprobs=logprobs,
+        request_rate=request_rate,
+        burstiness=burstiness,
+        disable_tqdm=disable_tqdm,
+        num_warmups=num_warmups,
+        profile=False,  # only profile on stage 2
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        ignore_eos=ignore_eos,
+        goodput_config_dict=goodput_config_dict,
+        max_concurrency=max_concurrency,
+        lora_modules=lora_modules,
+        extra_headers=extra_headers,
+        extra_body=stage1_extra_body,
+        ramp_up_strategy=ramp_up_strategy,
+        ramp_up_start_rps=ramp_up_start_rps,
+        ramp_up_end_rps=ramp_up_end_rps,
+        ready_check_timeout_sec=ready_check_timeout_sec,
+    )
+
+    stage1_texts: list[str] = stage1_result.get("generated_texts", [])
+
+    # Log stage-1 input / output for every request
+    for idx, (req, thinking) in enumerate(
+        zip(input_requests, stage1_texts)
+    ):
+        logger.info(
+            "[Stage1] idx={} | req_id={} | prompt[:120]={!r} | thinking[:200]={!r}",
+            idx, req.request_id,
+            (req.prompt[:120] if isinstance(req.prompt, str) else str(req.prompt)[:120]),
+            (thinking or "")[:200],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Build stage-2 requests                                              #
+    # ------------------------------------------------------------------ #
+    stage2_requests: list[SampleRequest] = []
+    stage2_origin_indices: list[int] = []  # map back to original request
+
+    for idx, (req, thinking) in enumerate(
+        zip(input_requests, stage1_texts)
+    ):
+        if not thinking:
+            logger.warning(
+                "[Stage1] idx={} produced empty thinking – skipping stage 2",
+                idx,
+            )
+            continue
+        suffix = thinking + "</think>\n" + prompt_token
+        new_prompt = (req.prompt if isinstance(req.prompt, str) else req.prompt[0]) + suffix
+        new_prompt_len = len(tokenizer(new_prompt).input_ids)
+        stage2_requests.append(
+            SampleRequest(
+                prompt=new_prompt,
+                prompt_len=new_prompt_len,
+                expected_output_len=max_new_tokens,
+                multi_modal_data=req.multi_modal_data,
+                lora_request=req.lora_request,
+                request_id=f"{req.request_id}_s2" if req.request_id else None,
+            )
+        )
+        stage2_origin_indices.append(idx)
+
+    # ------------------------------------------------------------------ #
+    # Stage 2 – beam search                                               #
+    # ------------------------------------------------------------------ #
+    stage2_extra_body: dict[str, Any] = {
+        "n": num_beams,
+        "use_beam_search": True,
+        "best_of": num_beams,
+        "temperature": 0.0,
+    }
+
+    logger.info(
+        "===== OpenOpenRec Stage 2/2: Beam search ====="
+    )
+    logger.info(
+        "  num_beams={}, max_tokens={}, prompt_token={!r}, candidates={}",
+        num_beams, max_new_tokens, prompt_token, len(stage2_requests),
+    )
+
+    stage2_result = await benchmark(
+        task_type=task_type,
+        endpoint_type="openai",
+        api_url=api_url_completions,
+        base_url=base_url,
+        model_id=model_id,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        input_requests=stage2_requests,
+        logprobs=logprobs,
+        request_rate=request_rate,
+        burstiness=burstiness,
+        disable_tqdm=disable_tqdm,
+        num_warmups=0,  # already warmed up in stage 1
+        profile=profile,
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        ignore_eos=ignore_eos,
+        goodput_config_dict=goodput_config_dict,
+        max_concurrency=max_concurrency,
+        lora_modules=lora_modules,
+        extra_headers=extra_headers,
+        extra_body=stage2_extra_body,
+        ramp_up_strategy=ramp_up_strategy,
+        ramp_up_start_rps=ramp_up_start_rps,
+        ramp_up_end_rps=ramp_up_end_rps,
+        ready_check_timeout_sec=0,  # already checked in stage 1
+    )
+
+    stage2_texts: list[str] = stage2_result.get("generated_texts", [])
+
+    # Log stage-2 input / output
+    for i, (req, sid_text) in enumerate(zip(stage2_requests, stage2_texts)):
+        orig_idx = stage2_origin_indices[i]
+        orig_thinking = (stage1_texts[orig_idx] or "")[:120]
+        logger.info(
+            "[Stage2] orig_idx={} | req_id={} | thinking[:120]={!r} | sid_output={!r}",
+            orig_idx, req.request_id, orig_thinking, sid_text,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Combined summary                                                    #
+    # ------------------------------------------------------------------ #
+    total_duration = stage1_result["duration"] + stage2_result["duration"]
+    total_completed = min(
+        stage1_result.get("completed", 0),
+        stage2_result.get("completed", 0),
+    )
+    print("\n" + "=" * 60)
+    print("{:^60}".format("OpenOpenRec Two-Stage Combined Summary"))
+    print("=" * 60)
+    print("{:<45} {:<10}".format("Stage-1 completed:", stage1_result.get("completed", 0)))
+    print("{:<45} {:<10.2f}".format("Stage-1 duration (s):", stage1_result["duration"]))
+    print("{:<45} {:<10}".format("Stage-2 completed:", stage2_result.get("completed", 0)))
+    print("{:<45} {:<10.2f}".format("Stage-2 duration (s):", stage2_result["duration"]))
+    print("{:<45} {:<10.2f}".format("Total duration (s):", total_duration))
+    print("{:<45} {:<10.2f}".format(
+        "End-to-end throughput (req/s):",
+        total_completed / total_duration if total_duration > 0 else 0,
+    ))
+    print("=" * 60)
+
+    # Return a merged result dict for JSON saving
+    return {
+        "openopenrec_two_stage": True,
+        "stage1": stage1_result,
+        "stage2": stage2_result,
+        "total_duration": total_duration,
+        "total_completed": total_completed,
+        "total_throughput": total_completed / total_duration if total_duration > 0 else 0,
+    }
+
+
 def save_to_pytorch_benchmark_format(
     args: argparse.Namespace, results: dict[str, Any], file_name: str
 ) -> None:
@@ -1648,34 +1899,80 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     # Avoid GC processing "static" data - reduce pause times.
     freeze_gc_heap()
 
-    benchmark_result = await benchmark(
-        task_type=task_type,
-        endpoint_type=backend,
-        api_url=api_url,
-        base_url=base_url,
-        model_id=model_id,
-        model_name=model_name,
-        tokenizer=tokenizer,
-        input_requests=input_requests,
-        logprobs=args.logprobs,
-        request_rate=args.request_rate,
-        burstiness=args.burstiness,
-        disable_tqdm=args.disable_tqdm,
-        num_warmups=args.num_warmups,
-        profile=args.profile,
-        selected_percentile_metrics=percentile_metrics.split(","),
-        selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
-        ignore_eos=args.ignore_eos,
-        goodput_config_dict=goodput_config_dict,
-        max_concurrency=args.max_concurrency,
-        lora_modules=args.lora_modules,
-        extra_headers=headers,
-        extra_body=extra_body,
-        ramp_up_strategy=args.ramp_up_strategy,
-        ramp_up_start_rps=args.ramp_up_start_rps,
-        ramp_up_end_rps=args.ramp_up_end_rps,
-        ready_check_timeout_sec=args.ready_check_timeout_sec,
+    # Detect OpenOpenRec two-stage mode
+    is_openopenrec_two_stage = (
+        getattr(args, "dataset_name", None) == "openopenrec"
+        and getattr(args, "openopenrec_enable_thinking", False)
     )
+
+    if is_openopenrec_two_stage:
+        benchmark_result = await benchmark_openopenrec_two_stage(
+            task_type=task_type,
+            endpoint_type=backend,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            num_warmups=args.num_warmups,
+            profile=args.profile,
+            selected_percentile_metrics=percentile_metrics.split(","),
+            selected_percentiles=[
+                float(p) for p in args.metric_percentiles.split(",")
+            ],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=headers,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+            prompt_token=args.openopenrec_prompt_token,
+            num_beams=args.openopenrec_num_beams,
+            max_new_tokens=args.openopenrec_max_new_tokens,
+            max_thinking_tokens=args.openopenrec_max_thinking_tokens,
+            num_return_thinking=args.openopenrec_num_return_thinking,
+            thinking_temperature=args.openopenrec_thinking_temperature,
+            thinking_top_p=args.openopenrec_thinking_top_p,
+            thinking_top_k=args.openopenrec_thinking_top_k,
+        )
+    else:
+        benchmark_result = await benchmark(
+            task_type=task_type,
+            endpoint_type=backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            num_warmups=args.num_warmups,
+            profile=args.profile,
+            selected_percentile_metrics=percentile_metrics.split(","),
+            selected_percentiles=[
+                float(p) for p in args.metric_percentiles.split(",")
+            ],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=headers,
+            extra_body=extra_body,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+        )
 
     # Save config and results to json
     result_json: dict[str, Any] = {}

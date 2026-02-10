@@ -1517,7 +1517,55 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
     openopenrec_group.add_argument(
         "--openopenrec-enable-thinking",
         action="store_true",
-        help="Apply tokenizer chat template with enable_thinking=True when building prompts.",
+        help="Enable two-stage generation: thinking (sampling) then beam search.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-prompt-token",
+        type=str,
+        default="<|sid_begin|>",
+        help="Token appended before stage-2 beam search generation.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-num-beams",
+        type=int,
+        default=32,
+        help="Beam width for stage-2 beam search.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-max-new-tokens",
+        type=int,
+        default=3,
+        help="Max tokens for stage-2 beam search output.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-max-thinking-tokens",
+        type=int,
+        default=1000,
+        help="Max tokens for stage-1 thinking generation.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-num-return-thinking",
+        type=int,
+        default=1,
+        help="Number of thinking candidates per prompt (stage-1 n).",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-thinking-temperature",
+        type=float,
+        default=0.6,
+        help="Temperature for stage-1 thinking sampling.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-thinking-top-p",
+        type=float,
+        default=0.95,
+        help="Top-p for stage-1 thinking sampling.",
+    )
+    openopenrec_group.add_argument(
+        "--openopenrec-thinking-top-k",
+        type=int,
+        default=50,
+        help="Top-k for stage-1 thinking sampling.",
     )
 
     spec_bench_group = parser.add_argument_group("spec bench dataset options")
