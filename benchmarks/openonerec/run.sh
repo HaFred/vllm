@@ -15,6 +15,10 @@ set -euo pipefail
 #     - a parquet file containing a 'messages' column, OR
 #     - a directory containing video/video_test.parquet or video_test.parquet
 
+# Path to the vllm binary. By default, use the local vllm_genrec entry point.
+# Override with: VLLM_BIN=/path/to/your/vllm ./run.sh
+VLLM_BIN=${VLLM_BIN:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/vllm_genrec/vllm"}
+
 DATASET_PATH=${DATASET_PATH:-"/path/to/data_v1.0"}
 HOST=${HOST:-"127.0.0.1"}
 PORT=${PORT:-8000}
@@ -25,7 +29,7 @@ NUM_PROMPTS=${NUM_PROMPTS:-1000}
 # You may need to adjust field names to match your server.
 EXTRA_BODY=${EXTRA_BODY:-'{"n":32,"use_beam_search":true,"best_of":32}'}
 
-vllm bench serve \
+"$VLLM_BIN" bench serve \
   --backend openai-chat \
   --host "$HOST" \
   --port "$PORT" \
