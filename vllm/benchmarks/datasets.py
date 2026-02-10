@@ -10,6 +10,7 @@ generation. Supported dataset types include:
   - BurstGPT
   - HuggingFace
   - VisionArena
+  - OpenOneRec (OpenOpenRec)
 """
 
 import argparse
@@ -252,6 +253,136 @@ class BenchmarkDataset(ABC):
                 "requests. Please ensure that each request_id "
                 "is unique."
             )
+
+
+class OpenOpenRecDataset(BenchmarkDataset):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+
+        import os
+
+        parquet_paths = [
+            self.dataset_path,
+            f"{self.dataset_path}/video/video_test.parquet",
+            f"{self.dataset_path}/video_test.parquet",
+        ]
+
+        parquet_path = None
+        for p in parquet_paths:
+            try:
+                if isinstance(p, str):
+                    if p.endswith(".parquet") and os.path.exists(p):
+                        parquet_path = p
+                        break
+                    if not p.endswith(".parquet") and os.path.isfile(p):
+                        parquet_path = p
+                        break
+            except Exception:
+                continue
+
+        if parquet_path is None:
+            if os.path.isdir(self.dataset_path):
+                raise FileNotFoundError(
+                    "Could not locate OpenOpenRec parquet under dataset_path. "
+                    "Expected one of: video/video_test.parquet, video_test.parquet, "
+                    "or dataset_path pointing directly to a .parquet file. "
+                    f"Got dataset_path={self.dataset_path!r}."
+                )
+            parquet_path = self.dataset_path
+
+        df = pd.read_parquet(parquet_path)
+        if "messages" not in df.columns:
+            raise ValueError("OpenOpenRec parquet must contain a 'messages' column.")
+
+        self.data = []
+        for _, row in df.iterrows():
+            self.data.append(row.to_dict())
+
+        random.seed(self.random_seed)
+        if not getattr(self, "disable_shuffle", False):
+            random.shuffle(self.data)
+
+    @staticmethod
+    def _convert_messages_format(messages: list) -> list:
+        converted = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                converted.append({"role": msg.get("role"), "content": "".join(text_parts)})
+            else:
+                converted.append(msg)
+        return converted
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        output_len: int | None = None,
+        enable_thinking: bool = False,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        self.num_available_samples = len(self.data)
+        if num_requests <= 0:
+            num_requests = self.num_available_samples
+
+        expected_output_len = 3 if output_len is None else output_len
+
+        sampled_requests: list[SampleRequest] = []
+        for i, item in enumerate(self.data):
+            if len(sampled_requests) >= num_requests:
+                break
+
+            messages = item.get("messages")
+            if isinstance(messages, str):
+                try:
+                    messages = json.loads(messages)
+                except Exception:
+                    continue
+
+            if not isinstance(messages, list):
+                continue
+
+            messages = self._convert_messages_format(messages)
+
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+            prompt_len = len(tokenizer(prompt).input_ids)
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=expected_output_len,
+                    request_id=request_id_prefix + str(i),
+                )
+            )
+
+        self.maybe_oversample_requests(
+            sampled_requests, num_requests, request_id_prefix, no_oversample
+        )
+        return sampled_requests
 
 
 # -----------------------------------------------------------------------------
@@ -1336,6 +1467,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
             "random-rerank",
             "hf",
             "custom",
+            "openopenrec",
             "prefix_repetition",
             "spec_bench",
         ],
@@ -1379,6 +1511,13 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         help="Number of output tokens per request. Unless it is set to -1, the "
         "value overrides potential output length loaded from the dataset. It is "
         "used only for custom dataset.",
+    )
+
+    openopenrec_group = parser.add_argument_group("openopenrec dataset options")
+    openopenrec_group.add_argument(
+        "--openopenrec-enable-thinking",
+        action="store_true",
+        help="Apply tokenizer chat template with enable_thinking=True when building prompts.",
     )
 
     spec_bench_group = parser.add_argument_group("spec bench dataset options")
@@ -1682,6 +1821,21 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
             tokenizer=tokenizer,
             output_len=args.custom_output_len,
             skip_chat_template=args.skip_chat_template,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
+
+    elif args.dataset_name == "openopenrec":
+        dataset = OpenOpenRecDataset(
+            dataset_path=args.dataset_path,
+            random_seed=args.seed,
+            disable_shuffle=args.disable_shuffle,
+        )
+        input_requests = dataset.sample(
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            output_len=args.output_len,
+            enable_thinking=bool(getattr(args, "openopenrec_enable_thinking", False)),
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
         )
