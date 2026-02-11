@@ -82,6 +82,8 @@ class SampleRequest:
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
+    groundtruth: str | None = None
+    sample_metadata: dict | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -370,12 +372,32 @@ class OpenOpenRecDataset(BenchmarkDataset):
                 )
 
             prompt_len = len(tokenizer(prompt).input_ids)
+
+            # Extract groundtruth from metadata column
+            groundtruth = None
+            sample_meta = None
+            raw_metadata = item.get("metadata")
+            if raw_metadata is not None:
+                if isinstance(raw_metadata, str):
+                    try:
+                        sample_meta = json.loads(raw_metadata)
+                    except Exception:
+                        sample_meta = None
+                elif isinstance(raw_metadata, dict):
+                    sample_meta = raw_metadata
+                if sample_meta is not None:
+                    answer = sample_meta.get("answer")
+                    if answer is not None:
+                        groundtruth = str(answer).strip()
+
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=expected_output_len,
                     request_id=request_id_prefix + str(i),
+                    groundtruth=groundtruth,
+                    sample_metadata=sample_meta,
                 )
             )
 

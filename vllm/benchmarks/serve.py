@@ -960,6 +960,9 @@ async def benchmark(
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
+            "all_generated_texts": [
+                output.all_generated_texts for output in outputs
+            ] if any(output.all_generated_texts for output in outputs) else [],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
@@ -1132,12 +1135,12 @@ def parse_goodput(slo_pairs):
 async def benchmark_openopenrec_two_stage(
     *,
     # common args forwarded to benchmark()
-    task_type: "TaskType",
+    task_type: TaskType,
     endpoint_type: str,
     base_url: str,
     model_id: str,
     model_name: str,
-    tokenizer: "TokenizerLike",
+    tokenizer: TokenizerLike,
     input_requests: list[SampleRequest],
     logprobs: int | None,
     request_rate: float,
@@ -1242,15 +1245,16 @@ async def benchmark_openopenrec_two_stage(
 
     stage1_texts: list[str] = stage1_result.get("generated_texts", [])
 
-    # Log stage-1 input / output for every request
+    # Log stage-1 input / output / groundtruth for every request
     for idx, (req, thinking) in enumerate(
         zip(input_requests, stage1_texts)
     ):
         logger.info(
-            "[Stage1] idx={} | req_id={} | prompt[:120]={!r} | thinking[:200]={!r}",
+            "[Stage1] idx={} | req_id={} | prompt[:120]={!r} | thinking[:200]={!r} | groundtruth[:200]={!r}",
             idx, req.request_id,
             (req.prompt[:120] if isinstance(req.prompt, str) else str(req.prompt)[:120]),
             (thinking or "")[:200],
+            (req.groundtruth or "")[:200],
         )
 
     # ------------------------------------------------------------------ #
@@ -1289,7 +1293,7 @@ async def benchmark_openopenrec_two_stage(
     stage2_extra_body: dict[str, Any] = {
         "n": num_beams,
         "use_beam_search": True,
-        "best_of": num_beams,
+        # "best_of": num_beams,  # n is already num beams
         "temperature": 0.0,
     }
 
@@ -1303,7 +1307,7 @@ async def benchmark_openopenrec_two_stage(
 
     stage2_result = await benchmark(
         task_type=task_type,
-        endpoint_type="openai",
+        endpoint_type="openai-beam",
         api_url=api_url_completions,
         base_url=base_url,
         model_id=model_id,
@@ -1315,7 +1319,7 @@ async def benchmark_openopenrec_two_stage(
         burstiness=burstiness,
         disable_tqdm=disable_tqdm,
         num_warmups=0,  # already warmed up in stage 1
-        profile=profile,
+        profile=False,
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         ignore_eos=ignore_eos,
@@ -1331,15 +1335,42 @@ async def benchmark_openopenrec_two_stage(
     )
 
     stage2_texts: list[str] = stage2_result.get("generated_texts", [])
+    # all_generated_texts[i] is a list of all beam choices for request i
+    stage2_all_texts: list[list[str]] = stage2_result.get(
+        "all_generated_texts", []
+    )
 
-    # Log stage-2 input / output
-    for i, (req, sid_text) in enumerate(zip(stage2_requests, stage2_texts)):
+    # Log stage-2 results for every request (all beams + groundtruth),
+    # mirroring the test_generated.json.debug format from OpenOneRec.
+    for i, req in enumerate(stage2_requests):
         orig_idx = stage2_origin_indices[i]
-        orig_thinking = (stage1_texts[orig_idx] or "")[:120]
-        logger.info(
-            "[Stage2] orig_idx={} | req_id={} | thinking[:120]={!r} | sid_output={!r}",
-            orig_idx, req.request_id, orig_thinking, sid_text,
+        orig_req = input_requests[orig_idx]
+        groundtruth = orig_req.groundtruth or ""
+
+        # All beam texts for this request
+        beams: list[str] = (
+            stage2_all_texts[i] if i < len(stage2_all_texts) else []
         )
+        first_text = stage2_texts[i] if i < len(stage2_texts) else ""
+
+        logger.info(
+            "[Stage2] orig_idx={} | req_id={} | n_beams={} | "
+            "groundtruth[:200]={!r}",
+            orig_idx,
+            req.request_id,
+            len(beams),
+            groundtruth[:200],
+        )
+        # Log each beam individually (like generations[] in
+        # test_generated.json.debug)
+        for beam_idx, beam_text in enumerate(beams):
+            logger.info(
+                "[Stage2][Beam] orig_idx={} | beam={}/{} | text={!r}",
+                orig_idx,
+                beam_idx,
+                len(beams),
+                beam_text,
+            )
 
     # ------------------------------------------------------------------ #
     # Combined summary                                                    #
