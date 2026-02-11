@@ -627,3 +627,7 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    # Controls whether this beam search request should skip *reading* from the
+    # prefix cache. When None, the engine falls back to its default behavior,
+    # which typically enables prefix-cache reads when possible.
+    skip_reading_prefix_cache: bool | None = None

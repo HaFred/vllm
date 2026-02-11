@@ -184,3 +184,77 @@ def test_beam_search_passes_multimodal_data(
                 filtered_hf_output_ids = filtered_hf_output_ids[:-1]
 
             assert filtered_hf_output_ids == filtered_vllm_output_ids
+
+
+@pytest.mark.parametrize("dtype", ["half"])
+@pytest.mark.parametrize("max_tokens", MAX_TOKENS)
+@pytest.mark.parametrize("beam_width", BEAM_WIDTHS)
+def test_beam_search_prefix_cache_flag_and_concurrency(
+    vllm_runner,
+    example_prompts,
+    model: str = MODELS[0],
+    dtype: str = "half",
+    max_tokens: int = MAX_TOKENS[0],
+    beam_width: int = BEAM_WIDTHS[0],
+) -> None:
+    """
+    Smoke test for offline beam search with prefix caching flags and
+    different concurrency limits.
+
+    This does not assert on cache metrics directly, but ensures that:
+    - Beam search runs successfully when skip_reading_prefix_cache is
+      explicitly set on BeamSearchParams.
+    - The concurrency_limit bounds logic (None, > len(prompts), small
+      positive values) does not change the shape of outputs.
+    """
+    prompts = example_prompts[:4]
+
+    # Use a small engine with prefix caching enabled to exercise the path.
+    with vllm_runner(
+        model,
+        dtype=dtype,
+        enable_prefix_caching=True,
+    ) as vllm_model:
+        # Baseline: default BeamSearchParams (skip_reading_prefix_cache=None)
+        baseline_outputs = vllm_model.generate_beam_search(
+            prompts,
+            beam_width,
+            max_tokens,
+            concurrency_limit=None,
+        )
+
+        # Explicitly allow cache reads.
+        outputs_with_cache_reads = vllm_model.llm.beam_search(
+            vllm_model.get_inputs(prompts),
+            BeamSearchParams(
+                beam_width=beam_width,
+                max_tokens=max_tokens,
+                skip_reading_prefix_cache=False,
+            ),
+            concurrency_limit=len(prompts) + 5,
+        )
+
+        # Explicitly disable cache reads and use a small concurrency limit.
+        outputs_without_cache_reads = vllm_model.llm.beam_search(
+            vllm_model.get_inputs(prompts),
+            BeamSearchParams(
+                beam_width=beam_width,
+                max_tokens=max_tokens,
+                skip_reading_prefix_cache=True,
+            ),
+            concurrency_limit=1,
+        )
+
+    # Shape checks: number of prompts and beams should match across runs.
+    assert len(baseline_outputs) == len(outputs_with_cache_reads) == len(
+        outputs_without_cache_reads
+    )
+
+    for i in range(len(prompts)):
+        baseline_token_ids, _ = baseline_outputs[i]
+        beams_with_cache_reads = outputs_with_cache_reads[i].sequences
+        beams_without_cache_reads = outputs_without_cache_reads[i].sequences
+
+        assert len(baseline_token_ids) == len(beams_with_cache_reads) == len(
+            beams_without_cache_reads
+        )

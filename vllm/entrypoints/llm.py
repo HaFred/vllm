@@ -606,8 +606,16 @@ class LLM:
             params: The beam search parameters.
             lora_request: LoRA request to use for generation, if any.
             use_tqdm: Whether to use tqdm to display the progress bar.
-            concurrency_limit: The maximum number of concurrent requests.
-                If None, the number of concurrent requests is unlimited.
+            concurrency_limit: The maximum number of prompts processed
+                concurrently during beam search. This controls how many
+                prompt groups are active in each decoding step:
+
+                - If None (default), all prompts are processed together,
+                  maximizing batching and throughput at the cost of peak
+                  memory usage.
+                - Smaller values (e.g., 2 or 4) bound peak memory usage by
+                  splitting prompts into chunks, at the cost of some
+                  throughput.
         """
         # TODO: how does beam search work together with length penalty,
         # frequency, penalty, and stopping criteria, etc.?
@@ -634,6 +642,13 @@ class LLM:
 
         if concurrency_limit is None:
             concurrency_limit = len(prompts)
+        else:
+            # Bound concurrency_limit to a sensible range: at least 1 and
+            # no more than the total number of prompts.
+            if concurrency_limit < 1:
+                concurrency_limit = 1
+            elif concurrency_limit > len(prompts):
+                concurrency_limit = len(prompts)
 
         def create_tokens_prompt_from_beam(beam: BeamSearchSequence) -> TokensPrompt:
             token_prompt_kwargs: TokensPrompt = {"prompt_token_ids": beam.tokens}
@@ -653,6 +668,13 @@ class LLM:
             temperature=temperature,
             skip_clone=True,  # Internal beam search, safe to skip clone
         )
+        # Respect any explicit cache-read preference provided for this beam
+        # search request. When None, SamplingParams falls back to its default
+        # behavior, which typically enables prefix cache reads when available.
+        if params.skip_reading_prefix_cache is not None:
+            beam_search_params.skip_reading_prefix_cache = (
+                params.skip_reading_prefix_cache
+            )
         instances: list[BeamSearchInstance] = []
 
         for lora_req, prompt in zip(lora_requests, prompts):
