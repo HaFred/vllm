@@ -37,6 +37,7 @@ from typing import Any, Literal
 
 import aiohttp
 import numpy as np
+from loguru import logger
 from tqdm.asyncio import tqdm
 
 from vllm.benchmarks.datasets import SampleRequest, add_dataset_parser, get_samples
@@ -959,6 +960,9 @@ async def benchmark(
             "ttfts": [output.ttft for output in outputs],
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
+            "all_generated_texts": [
+                output.all_generated_texts for output in outputs
+            ] if any(output.all_generated_texts for output in outputs) else [],
             "errors": [output.error for output in outputs],
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
@@ -1121,6 +1125,528 @@ def parse_goodput(slo_pairs):
             "number in milliseconds."
         ) from err
     return goodput_config_dict
+
+
+# ---------------------------------------------------------------------------
+# OpenOpenRec evaluation utilities
+# ---------------------------------------------------------------------------
+# Metric computation functions copied from
+#   OpenOneRec/benchmarks/benchmark/tasks/v1_0/recommendation/utils.py
+# to keep vllm_genrec self-contained.  The logic is intentionally identical.
+
+
+def _extract_ids_from_answer(answer: str) -> set[str]:
+    """Extract all SIDs from answer field.
+
+    >>> _extract_ids_from_answer("<|sid_begin|>123<|sid_end|><|sid_begin|>456<|sid_end|>")
+    {'123', '456'}
+    """
+    correct_answers: set[str] = set()
+    for part in answer.split('<|sid_begin|>'):
+        if '<|sid_end|>' in part:
+            sid = part.split('<|sid_end|>')[0].strip()
+            if sid:
+                correct_answers.add(sid)
+    return correct_answers
+
+
+def _extract_first_id_from_answer(answer: str) -> str:
+    """Extract the first SID from answer field."""
+    for part in answer.split('<|sid_begin|>'):
+        if '<|sid_end|>' in part:
+            sid = part.split('<|sid_end|>')[0].strip()
+            if sid:
+                return sid
+    return ""
+
+
+def _extract_id_from_generation(generation: str) -> str:
+    """Extract SID from a single model generation string."""
+    generation = generation.strip()
+
+    # If generation contains </think>, only process content after it
+    if '</think>' in generation:
+        generation = generation.split('</think>')[-1].strip()
+
+    # Try to extract from <|sid_begin|>...<|sid_end|> pattern
+    if '<|sid_begin|>' in generation:
+        for part in generation.split('<|sid_begin|>'):
+            if '<|sid_end|>' in part:
+                sid = part.split('<|sid_end|>')[0].strip()
+                if sid:
+                    return sid
+            elif part.strip():  # No end marker, take the content after begin marker
+                return part.strip()
+
+    # Otherwise, return the stripped generation
+    return generation
+
+
+def _compute_pass_at_k(
+    predicted_sids: list[str],
+    ground_truth_sids: set[str],
+    k: int,
+) -> bool:
+    """Pass@k: True if any of the first *k* predicted SIDs is in ground truth."""
+    if not predicted_sids or not ground_truth_sids:
+        return False
+    top_k_sids = predicted_sids[:k]
+    for sid in top_k_sids:
+        if sid in ground_truth_sids:
+            return True
+    return False
+
+
+def _compute_position1_pass_at_k(
+    predicted_sids: list[str],
+    first_ground_truth_sid: str,
+    k: int,
+) -> bool:
+    """Position1_Pass@k: True if any of the first *k* predicted SIDs matches
+    the *first* ground-truth SID."""
+    if not predicted_sids or not first_ground_truth_sid:
+        return False
+    top_k_sids = predicted_sids[:k]
+    for sid in top_k_sids:
+        if sid == first_ground_truth_sid:
+            return True
+    return False
+
+
+def _compute_recall_at_k(
+    predicted_sids: list[str],
+    ground_truth_sids: set[str],
+    k: int,
+) -> float:
+    """Recall@k: fraction of ground-truth SIDs found in the first *k* predictions."""
+    if not predicted_sids or not ground_truth_sids:
+        return 0.0
+    top_k_sids = predicted_sids[:k]
+    predicted_sids_set = set(sid for sid in top_k_sids if sid)
+    hit_count = len(predicted_sids_set & ground_truth_sids)
+    recall = hit_count / len(ground_truth_sids)
+    return recall
+
+
+def evaluate_openopenrec(
+    input_requests: list[SampleRequest],
+    stage2_all_texts: list[list[str]],
+    stage2_origin_indices: list[int],
+    k_values: list[int],
+) -> dict[str, Any]:
+    """Compute pass@k, position1_pass@k, recall@k for OpenOpenRec stage-2 outputs.
+
+    Uses exactly the same metric logic as
+    ``OpenOneRec/benchmarks/benchmark/tasks/v1_0/recommendation/evaluator.py``.
+
+    Returns a dict with overall metrics **and** a ``per_sample`` sub-dict.
+    """
+    total = len(input_requests)
+
+    pass_counts = {k: 0 for k in k_values}
+    pos1_pass_counts = {k: 0 for k in k_values}
+    recall_sums = {k: 0.0 for k in k_values}
+    evaluated = 0
+    skipped_no_gt = 0
+    skipped_no_gen = 0
+    per_sample: dict[str, dict[str, Any]] = {}
+
+    for s2_idx in range(len(stage2_origin_indices)):
+        orig_idx = stage2_origin_indices[s2_idx]
+        orig_req = input_requests[orig_idx]
+        groundtruth = orig_req.groundtruth or ""
+        sample_id = orig_req.request_id or str(orig_idx)
+
+        ground_truth_ids = _extract_ids_from_answer(groundtruth)
+        first_gt_id = _extract_first_id_from_answer(groundtruth)
+
+        if not ground_truth_ids:
+            skipped_no_gt += 1
+            continue
+
+        beams: list[str] = (
+            stage2_all_texts[s2_idx]
+            if s2_idx < len(stage2_all_texts)
+            else []
+        )
+
+        if not beams:
+            skipped_no_gen += 1
+            continue
+
+        # Extract predicted SIDs from beam outputs
+        predicted_sids = [_extract_id_from_generation(b) for b in beams]
+
+        sample_metrics: dict[str, Any] = {}
+        for k in k_values:
+            p = _compute_pass_at_k(predicted_sids, ground_truth_ids, k)
+            p1 = _compute_position1_pass_at_k(predicted_sids, first_gt_id, k)
+            r = _compute_recall_at_k(predicted_sids, ground_truth_ids, k)
+            sample_metrics[f"pass@{k}"] = p
+            sample_metrics[f"position1_pass@{k}"] = p1
+            sample_metrics[f"recall@{k}"] = r
+            if p:
+                pass_counts[k] += 1
+            if p1:
+                pos1_pass_counts[k] += 1
+            recall_sums[k] += r
+
+        per_sample[sample_id] = sample_metrics
+        evaluated += 1
+
+    # Aggregate
+    metrics: dict[str, Any] = {
+        "total_samples": total,
+        "evaluated_samples": evaluated,
+        "skipped_no_groundtruth": skipped_no_gt,
+        "skipped_no_generation": skipped_no_gen,
+    }
+    for k in k_values:
+        denom = evaluated if evaluated > 0 else 1
+        metrics[f"pass@{k}"] = pass_counts[k] / denom
+        metrics[f"position1_pass@{k}"] = pos1_pass_counts[k] / denom
+        metrics[f"recall@{k}"] = recall_sums[k] / denom
+
+    metrics["per_sample"] = per_sample
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# OpenOpenRec two-stage benchmark
+# ---------------------------------------------------------------------------
+
+
+async def benchmark_openopenrec_two_stage(
+    *,
+    # common args forwarded to benchmark()
+    task_type: TaskType,
+    endpoint_type: str,
+    base_url: str,
+    model_id: str,
+    model_name: str,
+    tokenizer: TokenizerLike,
+    input_requests: list[SampleRequest],
+    logprobs: int | None,
+    request_rate: float,
+    burstiness: float,
+    disable_tqdm: bool,
+    num_warmups: int,
+    profile: bool,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    ignore_eos: bool,
+    goodput_config_dict: dict[str, float],
+    max_concurrency: int | None,
+    lora_modules: Iterable[str] | None,
+    extra_headers: dict | None,
+    ramp_up_strategy: Literal["linear", "exponential"] | None,
+    ramp_up_start_rps: int | None,
+    ramp_up_end_rps: int | None,
+    ready_check_timeout_sec: int,
+    # two-stage specific
+    prompt_token: str,
+    num_beams: int,
+    max_new_tokens: int,
+    max_thinking_tokens: int,
+    num_return_thinking: int,
+    thinking_temperature: float,
+    thinking_top_p: float,
+    thinking_top_k: int,
+    # evaluation
+    k_values: list[int] | None = None,
+) -> dict[str, Any]:
+    """Run the OpenOneRec two-stage benchmark.
+
+    Stage 1 – thinking (sampling, stop at ``</think>``).
+    Stage 2 – beam search with *prompt_token* appended after thinking.
+
+    Each stage delegates to :func:`benchmark` so that the standard vLLM
+    serving metrics are collected and printed.
+    """
+
+    host_port = base_url.split("//", 1)[-1]  # strip scheme
+    api_url_completions = f"{base_url}/v1/completions"
+
+    # ------------------------------------------------------------------ #
+    # Stage 1 – thinking                                                  #
+    # ------------------------------------------------------------------ #
+    stage1_extra_body: dict[str, Any] = {
+        "stop": ["</think>"],
+        "n": num_return_thinking,
+        "temperature": thinking_temperature,
+        "top_p": thinking_top_p,
+    }
+    if thinking_top_k > 0:
+        stage1_extra_body["top_k"] = thinking_top_k
+
+    stage1_requests = [
+        SampleRequest(
+            prompt=r.prompt,
+            prompt_len=r.prompt_len,
+            expected_output_len=max_thinking_tokens,
+            multi_modal_data=r.multi_modal_data,
+            lora_request=r.lora_request,
+            request_id=r.request_id,
+        )
+        for r in input_requests
+    ]
+
+    logger.info(
+        "===== OpenOpenRec Stage 1/2: Thinking (sampling) ====="
+    )
+    logger.info(
+        "  n={}, max_tokens={}, temp={}, top_p={}, top_k={}, stop=['</think>']",
+        num_return_thinking, max_thinking_tokens,
+        thinking_temperature, thinking_top_p, thinking_top_k,
+    )
+
+    stage1_result = await benchmark(
+        task_type=task_type,
+        endpoint_type="openai",
+        api_url=api_url_completions,
+        base_url=base_url,
+        model_id=model_id,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        input_requests=stage1_requests,
+        logprobs=logprobs,
+        request_rate=request_rate,
+        burstiness=burstiness,
+        disable_tqdm=disable_tqdm,
+        num_warmups=num_warmups,
+        profile=False,  # only profile on stage 2
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        ignore_eos=ignore_eos,
+        goodput_config_dict=goodput_config_dict,
+        max_concurrency=max_concurrency,
+        lora_modules=lora_modules,
+        extra_headers=extra_headers,
+        extra_body=stage1_extra_body,
+        ramp_up_strategy=ramp_up_strategy,
+        ramp_up_start_rps=ramp_up_start_rps,
+        ramp_up_end_rps=ramp_up_end_rps,
+        ready_check_timeout_sec=ready_check_timeout_sec,
+    )
+
+    stage1_texts: list[str] = stage1_result.get("generated_texts", [])
+
+    # Log stage-1 input / output / groundtruth for every request
+    for idx, (req, thinking) in enumerate(
+        zip(input_requests, stage1_texts)
+    ):
+        logger.info(
+            "[Stage1] idx={} | req_id={} | prompt[:120]={!r} | thinking[:200]={!r} | groundtruth[:200]={!r}",
+            idx, req.request_id,
+            (req.prompt[:120] if isinstance(req.prompt, str) else str(req.prompt)[:120]),
+            (thinking or "")[:200],
+            (req.groundtruth or "")[:200],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Build stage-2 requests                                              #
+    # ------------------------------------------------------------------ #
+    stage2_requests: list[SampleRequest] = []
+    stage2_origin_indices: list[int] = []  # map back to original request
+
+    for idx, (req, thinking) in enumerate(
+        zip(input_requests, stage1_texts)
+    ):
+        if not thinking:
+            logger.warning(
+                "[Stage1] idx={} produced empty thinking – skipping stage 2",
+                idx,
+            )
+            continue
+        suffix = thinking + "</think>\n" + prompt_token
+        new_prompt = (req.prompt if isinstance(req.prompt, str) else req.prompt[0]) + suffix
+        new_prompt_len = len(tokenizer(new_prompt).input_ids)
+        stage2_requests.append(
+            SampleRequest(
+                prompt=new_prompt,
+                prompt_len=new_prompt_len,
+                expected_output_len=max_new_tokens,
+                multi_modal_data=req.multi_modal_data,
+                lora_request=req.lora_request,
+                request_id=f"{req.request_id}_s2" if req.request_id else None,
+            )
+        )
+        stage2_origin_indices.append(idx)
+
+    # ------------------------------------------------------------------ #
+    # Stage 2 – beam search                                               #
+    # ------------------------------------------------------------------ #
+    stage2_extra_body: dict[str, Any] = {
+        "n": num_beams,
+        "use_beam_search": True,
+        # "best_of": num_beams,  # n is already num beams
+        "temperature": 0.0,
+    }
+
+    logger.info(
+        "===== OpenOpenRec Stage 2/2: Beam search ====="
+    )
+    logger.info(
+        "  num_beams={}, max_tokens={}, prompt_token={!r}, candidates={}",
+        num_beams, max_new_tokens, prompt_token, len(stage2_requests),
+    )
+
+    stage2_result = await benchmark(
+        task_type=task_type,
+        endpoint_type="openai-beam",
+        api_url=api_url_completions,
+        base_url=base_url,
+        model_id=model_id,
+        model_name=model_name,
+        tokenizer=tokenizer,
+        input_requests=stage2_requests,
+        logprobs=logprobs,
+        request_rate=request_rate,
+        burstiness=burstiness,
+        disable_tqdm=disable_tqdm,
+        num_warmups=0,  # already warmed up in stage 1
+        profile=False,
+        selected_percentile_metrics=selected_percentile_metrics,
+        selected_percentiles=selected_percentiles,
+        ignore_eos=ignore_eos,
+        goodput_config_dict=goodput_config_dict,
+        max_concurrency=max_concurrency,
+        lora_modules=lora_modules,
+        extra_headers=extra_headers,
+        extra_body=stage2_extra_body,
+        ramp_up_strategy=ramp_up_strategy,
+        ramp_up_start_rps=ramp_up_start_rps,
+        ramp_up_end_rps=ramp_up_end_rps,
+        ready_check_timeout_sec=0,  # already checked in stage 1
+    )
+
+    stage2_texts: list[str] = stage2_result.get("generated_texts", [])
+    # all_generated_texts[i] is a list of all beam choices for request i
+    stage2_all_texts: list[list[str]] = stage2_result.get(
+        "all_generated_texts", []
+    )
+
+    # Log stage-2 results for every request (all beams + groundtruth),
+    # mirroring the test_generated.json.debug format from OpenOneRec.
+    for i, req in enumerate(stage2_requests):
+        orig_idx = stage2_origin_indices[i]
+        orig_req = input_requests[orig_idx]
+        groundtruth = orig_req.groundtruth or ""
+
+        # All beam texts for this request
+        beams: list[str] = (
+            stage2_all_texts[i] if i < len(stage2_all_texts) else []
+        )
+        first_text = stage2_texts[i] if i < len(stage2_texts) else ""
+
+        logger.info(
+            "[Stage2] orig_idx={} | req_id={} | n_beams={} | "
+            "groundtruth[:200]={!r}",
+            orig_idx,
+            req.request_id,
+            len(beams),
+            groundtruth[:200],
+        )
+        # Log each beam individually (like generations[] in
+        # test_generated.json.debug)
+        for beam_idx, beam_text in enumerate(beams):
+            logger.info(
+                "[Stage2][Beam] orig_idx={} | beam={}/{} | text={!r}",
+                orig_idx,
+                beam_idx,
+                len(beams),
+                beam_text,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Evaluation                                                           #
+    # ------------------------------------------------------------------ #
+    eval_k_values = k_values if k_values else [1, 32]
+    eval_metrics: dict[str, Any] = {}
+
+    if stage2_all_texts:
+        eval_metrics = evaluate_openopenrec(
+            input_requests=input_requests,
+            stage2_all_texts=stage2_all_texts,
+            stage2_origin_indices=stage2_origin_indices,
+            k_values=eval_k_values,
+        )
+        logger.info(
+            "===== OpenOpenRec Evaluation (k_values={}) =====",
+            eval_k_values,
+        )
+        for k in eval_k_values:
+            logger.info(
+                "  pass@{}={:.4f}  position1_pass@{}={:.4f}  recall@{}={:.4f}",
+                k, eval_metrics.get(f"pass@{k}", 0.0),
+                k, eval_metrics.get(f"position1_pass@{k}", 0.0),
+                k, eval_metrics.get(f"recall@{k}", 0.0),
+            )
+        logger.info(
+            "  evaluated={} / total={} (skipped: no_gt={}, no_gen={})",
+            eval_metrics.get("evaluated_samples", 0),
+            eval_metrics.get("total_samples", 0),
+            eval_metrics.get("skipped_no_groundtruth", 0),
+            eval_metrics.get("skipped_no_generation", 0),
+        )
+    else:
+        logger.warning(
+            "No stage-2 beam texts available – skipping evaluation."
+        )
+
+    # ------------------------------------------------------------------ #
+    # Combined summary                                                    #
+    # ------------------------------------------------------------------ #
+    total_duration = stage1_result["duration"] + stage2_result["duration"]
+    total_completed = min(
+        stage1_result.get("completed", 0),
+        stage2_result.get("completed", 0),
+    )
+    print("\n" + "=" * 60)
+    print("{:^60}".format("OpenOpenRec Two-Stage Combined Summary"))
+    print("=" * 60)
+    print("{:<45} {:<10}".format("Stage-1 completed:", stage1_result.get("completed", 0)))
+    print("{:<45} {:<10.2f}".format("Stage-1 duration (s):", stage1_result["duration"]))
+    print("{:<45} {:<10}".format("Stage-2 completed:", stage2_result.get("completed", 0)))
+    print("{:<45} {:<10.2f}".format("Stage-2 duration (s):", stage2_result["duration"]))
+    print("{:<45} {:<10.2f}".format("Total duration (s):", total_duration))
+    print("{:<45} {:<10.2f}".format(
+        "End-to-end throughput (req/s):",
+        total_completed / total_duration if total_duration > 0 else 0,
+    ))
+    if eval_metrics:
+        print("-" * 60)
+        print("{:^60}".format("Evaluation Metrics"))
+        print("-" * 60)
+        for k in eval_k_values:
+            print("{:<45} {:<10.4f}".format(
+                f"pass@{k}:", eval_metrics.get(f"pass@{k}", 0.0)))
+            print("{:<45} {:<10.4f}".format(
+                f"position1_pass@{k}:", eval_metrics.get(f"position1_pass@{k}", 0.0)))
+            print("{:<45} {:<10.4f}".format(
+                f"recall@{k}:", eval_metrics.get(f"recall@{k}", 0.0)))
+        print("{:<45} {}/{}".format(
+            "Evaluated / Total:",
+            eval_metrics.get("evaluated_samples", 0),
+            eval_metrics.get("total_samples", 0),
+        ))
+    print("=" * 60)
+
+    # Strip per_sample from top-level result to avoid bloating saved JSON;
+    # keep it under a separate key so --save-detailed can retain it.
+    eval_per_sample = eval_metrics.pop("per_sample", {})
+
+    # Return a merged result dict for JSON saving
+    return {
+        "openopenrec_two_stage": True,
+        "stage1": stage1_result,
+        "stage2": stage2_result,
+        "total_duration": total_duration,
+        "total_completed": total_completed,
+        "total_throughput": total_completed / total_duration if total_duration > 0 else 0,
+        "evaluation": eval_metrics,
+        "evaluation_per_sample": eval_per_sample,
+    }
 
 
 def save_to_pytorch_benchmark_format(
@@ -1648,34 +2174,81 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     # Avoid GC processing "static" data - reduce pause times.
     freeze_gc_heap()
 
-    benchmark_result = await benchmark(
-        task_type=task_type,
-        endpoint_type=backend,
-        api_url=api_url,
-        base_url=base_url,
-        model_id=model_id,
-        model_name=model_name,
-        tokenizer=tokenizer,
-        input_requests=input_requests,
-        logprobs=args.logprobs,
-        request_rate=args.request_rate,
-        burstiness=args.burstiness,
-        disable_tqdm=args.disable_tqdm,
-        num_warmups=args.num_warmups,
-        profile=args.profile,
-        selected_percentile_metrics=percentile_metrics.split(","),
-        selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
-        ignore_eos=args.ignore_eos,
-        goodput_config_dict=goodput_config_dict,
-        max_concurrency=args.max_concurrency,
-        lora_modules=args.lora_modules,
-        extra_headers=headers,
-        extra_body=extra_body,
-        ramp_up_strategy=args.ramp_up_strategy,
-        ramp_up_start_rps=args.ramp_up_start_rps,
-        ramp_up_end_rps=args.ramp_up_end_rps,
-        ready_check_timeout_sec=args.ready_check_timeout_sec,
+    # Detect OpenOpenRec two-stage mode
+    is_openopenrec_two_stage = (
+        getattr(args, "dataset_name", None) == "openopenrec"
+        and getattr(args, "openopenrec_enable_thinking", False)
     )
+
+    if is_openopenrec_two_stage:
+        benchmark_result = await benchmark_openopenrec_two_stage(
+            task_type=task_type,
+            endpoint_type=backend,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            num_warmups=args.num_warmups,
+            profile=args.profile,
+            selected_percentile_metrics=percentile_metrics.split(","),
+            selected_percentiles=[
+                float(p) for p in args.metric_percentiles.split(",")
+            ],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=headers,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+            prompt_token=args.openopenrec_prompt_token,
+            num_beams=args.openopenrec_num_beams,
+            max_new_tokens=args.openopenrec_max_new_tokens,
+            max_thinking_tokens=args.openopenrec_max_thinking_tokens,
+            num_return_thinking=args.openopenrec_num_return_thinking,
+            thinking_temperature=args.openopenrec_thinking_temperature,
+            thinking_top_p=args.openopenrec_thinking_top_p,
+            thinking_top_k=args.openopenrec_thinking_top_k,
+            k_values=[int(x) for x in args.openopenrec_k_values.split(",")],
+        )
+    else:
+        benchmark_result = await benchmark(
+            task_type=task_type,
+            endpoint_type=backend,
+            api_url=api_url,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            num_warmups=args.num_warmups,
+            profile=args.profile,
+            selected_percentile_metrics=percentile_metrics.split(","),
+            selected_percentiles=[
+                float(p) for p in args.metric_percentiles.split(",")
+            ],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=headers,
+            extra_body=extra_body,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+        )
 
     # Save config and results to json
     result_json: dict[str, Any] = {}
@@ -1725,6 +2298,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "itls",
             "generated_texts",
             "errors",
+            "evaluation_per_sample",
         ]:
             if field in result_json:
                 del result_json[field]

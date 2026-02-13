@@ -93,6 +93,9 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     start_time: float = 0.0
+    all_generated_texts: list[str] = field(
+        default_factory=list
+    )  # all choices (e.g. beam search)
 
 
 class RequestFunc(Protocol):
@@ -753,10 +756,100 @@ async def async_request_infinity_embeddings_clip(
     )
 
 
+async def async_request_openai_completions_beam_search(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """Non-streaming completions request for beam search.
+
+    Unlike :func:`async_request_openai_completions`, this sends the request
+    with ``stream=false`` so that **all** ``n`` beam-search choices are
+    returned in a single JSON response.  The results are stored in
+    :pyattr:`RequestFuncOutput.all_generated_texts` (one entry per choice)
+    while ``generated_text`` contains ``choices[0]`` for backward
+    compatibility.
+    """
+    api_url = request_func_input.api_url
+    _validate_api_url(api_url, "OpenAI Completions API (beam)", "completions")
+
+    payload: dict[str, Any] = {
+        "model": request_func_input.model_name
+        if request_func_input.model_name
+        else request_func_input.model,
+        "prompt": request_func_input.prompt,
+        "temperature": 0.0,
+        "max_tokens": request_func_input.output_len,
+        "logprobs": request_func_input.logprobs,
+        "stream": False,
+    }
+    _update_payload_common(payload, request_func_input)
+
+    headers: dict[str, Any] = {
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+    }
+    _update_headers_common(headers, request_func_input)
+
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+
+    st = time.perf_counter()
+    output.start_time = st
+    try:
+        async with session.post(
+            url=api_url, json=payload, headers=headers
+        ) as response:
+            if response.status == 200:
+                body = await response.json()
+
+                choices = body.get("choices", [])
+                usage = body.get("usage", {})
+
+                # Time to first token ≈ full latency for non-streaming
+                output.ttft = time.perf_counter() - st
+                output.latency = output.ttft
+
+                if choices:
+                    # Sort choices by index to guarantee order
+                    choices.sort(key=lambda c: c.get("index", 0))
+                    output.generated_text = choices[0].get("text", "")
+                    output.all_generated_texts = [
+                        c.get("text", "") for c in choices
+                    ]
+                    output.success = True
+                else:
+                    output.success = False
+                    output.error = "No choices in beam search response."
+
+                # output_tokens from usage
+                output.output_tokens = usage.get(
+                    "completion_tokens", 0
+                )
+
+                # Approximate per-beam ITL: total latency / total output
+                # tokens across all beams.  This gives a rough tpot-like
+                # value that the metrics calculator can use.
+                if output.output_tokens > 1:
+                    approx_itl = output.latency / output.output_tokens
+                    output.itl = [approx_itl] * (output.output_tokens - 1)
+            else:
+                output.error = response.reason or ""
+                output.success = False
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 # TODO: Add more request functions for different API protocols.
 ASYNC_REQUEST_FUNCS: dict[str, RequestFunc] = {
     "vllm": async_request_openai_completions,
     "openai": async_request_openai_completions,
+    "openai-beam": async_request_openai_completions_beam_search,
     "openai-chat": async_request_openai_chat_completions,
     "openai-audio": async_request_openai_audio,
     "openai-embeddings": async_request_openai_embeddings,
