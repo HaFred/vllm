@@ -229,6 +229,40 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def transfer_blocks(
+        self,
+        from_request_id: str,
+        to_request_id: str,
+    ) -> tuple[list[KVCacheBlock], ...] | None:
+        """Transfer block references from a parent request to a child request.
+
+        Increments ref counts on the parent's blocks and registers them
+        for the child request so they survive parent cleanup.
+
+        Args:
+            from_request_id: The parent request ID.
+            to_request_id: The child (continuation) request ID.
+
+        Returns:
+            The inherited blocks per kv_cache_group, or None if the parent
+            has no blocks.
+        """
+        parent_blocks = self.get_blocks(from_request_id)
+        if not parent_blocks or not parent_blocks[0]:
+            return None
+
+        result: list[list[KVCacheBlock]] = []
+        for group_idx, manager in enumerate(self.single_type_managers):
+            group_blocks = parent_blocks[group_idx]
+            inherited = []
+            for block in group_blocks:
+                block.incr_ref()
+                inherited.append(block)
+            manager.req_to_blocks[to_request_id] = inherited
+            result.append(inherited)
+
+        return tuple(result)
+
     @abstractmethod
     def find_longest_cache_hit(
         self,

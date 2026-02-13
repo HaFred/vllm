@@ -1649,6 +1649,468 @@ async def benchmark_openopenrec_two_stage(
     }
 
 
+# ---------------------------------------------------------------------------
+# OpenOpenRec two-stage benchmark with distributed KVC (pipelined)
+# ---------------------------------------------------------------------------
+
+
+async def benchmark_openopenrec_two_stage_distributed_kvc(
+    *,
+    # common args forwarded to benchmark()
+    task_type: TaskType,
+    endpoint_type: str,
+    base_url: str,
+    model_id: str,
+    model_name: str,
+    tokenizer: TokenizerLike,
+    input_requests: list[SampleRequest],
+    logprobs: int | None,
+    request_rate: float,
+    burstiness: float,
+    disable_tqdm: bool,
+    num_warmups: int,
+    profile: bool,
+    selected_percentile_metrics: list[str],
+    selected_percentiles: list[float],
+    ignore_eos: bool,
+    goodput_config_dict: dict[str, float],
+    max_concurrency: int | None,
+    lora_modules: Iterable[str] | None,
+    extra_headers: dict | None,
+    ramp_up_strategy: Literal["linear", "exponential"] | None,
+    ramp_up_start_rps: int | None,
+    ramp_up_end_rps: int | None,
+    ready_check_timeout_sec: int,
+    # two-stage specific
+    prompt_token: str,
+    num_beams: int,
+    max_new_tokens: int,
+    max_thinking_tokens: int,
+    num_return_thinking: int,
+    thinking_temperature: float,
+    thinking_top_p: float,
+    thinking_top_k: int,
+    # evaluation
+    k_values: list[int] | None = None,
+) -> dict[str, Any]:
+    """Run the OpenOpenRec two-stage benchmark with distributed KV cache.
+
+    Unlike :func:`benchmark_openopenrec_two_stage` which runs stage 1 and
+    stage 2 **sequentially**, this function **pipelines** them: as soon as
+    each individual stage-1 (thinking) request finishes, its stage-2
+    (beam search) request is launched immediately.
+
+    This leverages vLLM's **automatic prefix caching** (APC) so that the
+    KV cache blocks computed during stage 1 are still warm when stage 2
+    starts.  Stage 2's prompt is a strict prefix-extension of stage 1's
+    prompt (original_prompt + thinking_output + ``</think>\\n`` +
+    prompt_token), so the scheduler can skip re-tokenisation and
+    re-prefill of the shared prefix entirely.
+
+    Requirements:
+        - The vLLM server must be started with ``--enable-prefix-caching``
+          (or APC enabled by default in v1) so that KV cache blocks are
+          retained and reusable across requests.
+
+    Stage 1 – thinking (sampling, stop at ``</think>``).
+    Stage 2 – beam search with *prompt_token* appended after thinking.
+    """
+
+    from vllm.benchmarks.lib.endpoint_request_func import (
+        RequestFuncInput,
+        RequestFuncOutput,  # used in type hints below
+        async_request_openai_completions,
+        async_request_openai_completions_beam_search,
+    )
+
+    api_url_completions = f"{base_url}/v1/completions"
+
+    logger.info(
+        "===== OpenOpenRec Distributed KVC: Pipelined Two-Stage ====="
+    )
+    logger.info(
+        "  Stage 1: n={}, max_tokens={}, temp={}, top_p={}, top_k={}, "
+        "stop=['</think>']",
+        num_return_thinking, max_thinking_tokens,
+        thinking_temperature, thinking_top_p, thinking_top_k,
+    )
+    logger.info(
+        "  Stage 2: num_beams={}, max_tokens={}, prompt_token={!r}",
+        num_beams, max_new_tokens, prompt_token,
+    )
+    logger.info(
+        "  KVC sharing via automatic prefix caching – stages pipelined "
+        "per request"
+    )
+
+    # ------------------------------------------------------------------ #
+    # Build stage-1 extra body                                             #
+    # ------------------------------------------------------------------ #
+    stage1_extra_body: dict[str, Any] = {
+        "stop": ["</think>"],
+        "n": num_return_thinking,
+        "temperature": thinking_temperature,
+        "top_p": thinking_top_p,
+    }
+    if thinking_top_k > 0:
+        stage1_extra_body["top_k"] = thinking_top_k
+
+    stage2_extra_body: dict[str, Any] = {
+        "n": num_beams,
+        "use_beam_search": True,
+        "temperature": 0.0,
+    }
+
+    # ------------------------------------------------------------------ #
+    # Shared HTTP session                                                  #
+    # ------------------------------------------------------------------ #
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency or 0,
+        limit_per_host=max_concurrency or 0,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        keepalive_timeout=60,
+        enable_cleanup_closed=True,
+        force_close=False,
+        ssl=("https://" in api_url_completions),
+    )
+    session = aiohttp.ClientSession(
+        connector=connector,
+        trust_env=True,
+        timeout=aiohttp.ClientTimeout(total=6 * 60 * 60),
+    )
+
+    # ------------------------------------------------------------------ #
+    # Endpoint readiness check                                             #
+    # ------------------------------------------------------------------ #
+    if ready_check_timeout_sec > 0:
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=input_requests[0].prompt,
+            api_url=api_url_completions,
+            prompt_len=input_requests[0].prompt_len,
+            output_len=input_requests[0].expected_output_len,
+            logprobs=logprobs,
+            multi_modal_content=input_requests[0].multi_modal_data,
+            ignore_eos=ignore_eos,
+            extra_headers=extra_headers,
+            extra_body=stage1_extra_body,
+        )
+        from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
+        test_output = await wait_for_endpoint(
+            async_request_openai_completions,
+            test_input,
+            session,
+            timeout_seconds=ready_check_timeout_sec,
+        )
+        if not test_output.success:
+            await session.close()
+            raise ValueError(
+                "Endpoint readiness check failed. "
+                f"Error: {test_output.error}"
+            )
+        print("Endpoint ready.")
+
+    # ------------------------------------------------------------------ #
+    # Concurrency control                                                  #
+    # ------------------------------------------------------------------ #
+    semaphore = (
+        asyncio.Semaphore(max_concurrency)
+        if max_concurrency
+        else contextlib.nullcontext()
+    )
+
+    # ------------------------------------------------------------------ #
+    # Per-request pipelined coroutine                                      #
+    # ------------------------------------------------------------------ #
+    # Results collected per original request index
+    stage1_outputs: dict[int, RequestFuncOutput] = {}
+    stage2_outputs: dict[int, RequestFuncOutput] = {}
+    stage1_texts: dict[int, str] = {}
+    stage2_all_texts_map: dict[int, list[str]] = {}
+
+    async def _run_pipelined_request(
+        idx: int,
+        req: SampleRequest,
+        pbar: tqdm | None,
+    ) -> None:
+        """Run stage 1 then immediately stage 2 for a single request."""
+        async with semaphore:
+            # ---------- Stage 1: thinking ----------
+            s1_input = RequestFuncInput(
+                model=model_id,
+                model_name=model_name,
+                prompt=req.prompt,
+                api_url=api_url_completions,
+                prompt_len=req.prompt_len,
+                output_len=max_thinking_tokens,
+                logprobs=logprobs,
+                multi_modal_content=req.multi_modal_data,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=stage1_extra_body,
+                request_id=req.request_id,
+            )
+            s1_out = await async_request_openai_completions(
+                request_func_input=s1_input, session=session, pbar=None,
+            )
+            stage1_outputs[idx] = s1_out
+
+            thinking = s1_out.generated_text if s1_out.success else ""
+            stage1_texts[idx] = thinking
+
+            logger.info(
+                "[DistKVC][Stage1] idx={} | req_id={} | success={} | "
+                "thinking[:200]={!r}",
+                idx, req.request_id, s1_out.success, (thinking or "")[:200],
+            )
+
+            if not thinking:
+                logger.warning(
+                    "[DistKVC][Stage1] idx={} produced empty thinking "
+                    "– skipping stage 2",
+                    idx,
+                )
+                if pbar:
+                    pbar.update(1)
+                return
+
+            # ---------- Stage 2: beam search (immediate, KVC shared) ----------
+            # Use continuation API: the engine inherits KV cache blocks
+            # from the stage-1 request directly, avoiding re-tokenisation
+            # and re-prefill of the shared prefix.
+            continuation_suffix = thinking + "</think>\n" + prompt_token
+
+            # Build stage2 extra_body with continuation fields
+            s2_body_with_continuation = dict(stage2_extra_body)
+            s2_body_with_continuation["continuation_of"] = (
+                req.request_id or f"req-{idx}"
+            )
+            s2_body_with_continuation["continuation_suffix"] = (
+                continuation_suffix
+            )
+
+            # We still need a prompt for the HTTP request schema,
+            # but it will be ignored by the engine when continuation_of
+            # is set. Use the original prompt as a placeholder.
+            placeholder_prompt = (
+                req.prompt if isinstance(req.prompt, str)
+                else req.prompt[0]
+            )
+
+            s2_input = RequestFuncInput(
+                model=model_id,
+                model_name=model_name,
+                prompt=placeholder_prompt,
+                api_url=api_url_completions,
+                prompt_len=req.prompt_len,
+                output_len=max_new_tokens,
+                logprobs=logprobs,
+                multi_modal_content=req.multi_modal_data,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=s2_body_with_continuation,
+                request_id=(
+                    f"{req.request_id}_s2" if req.request_id else None
+                ),
+            )
+            s2_out = await async_request_openai_completions_beam_search(
+                request_func_input=s2_input, session=session, pbar=None,
+            )
+            stage2_outputs[idx] = s2_out
+            stage2_all_texts_map[idx] = (
+                s2_out.all_generated_texts if s2_out.success else []
+            )
+
+            beams = stage2_all_texts_map[idx]
+            logger.info(
+                "[DistKVC][Stage2] idx={} | req_id={} | n_beams={} | "
+                "groundtruth[:200]={!r}",
+                idx, req.request_id, len(beams),
+                (req.groundtruth or "")[:200],
+            )
+            for beam_idx, beam_text in enumerate(beams):
+                logger.info(
+                    "[DistKVC][Stage2][Beam] idx={} | beam={}/{} | "
+                    "text={!r}",
+                    idx, beam_idx, len(beams), beam_text,
+                )
+
+        if pbar:
+            pbar.update(1)
+
+    # ------------------------------------------------------------------ #
+    # Launch all pipelined requests                                        #
+    # ------------------------------------------------------------------ #
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
+    benchmark_start_time = time.perf_counter()
+
+    tasks: list[asyncio.Task] = []
+    for idx, req in enumerate(input_requests):
+        # Respect request_rate for staggered launch
+        if request_rate != float("inf") and idx > 0:
+            delay = 1.0 / request_rate
+            await asyncio.sleep(delay)
+        tasks.append(
+            asyncio.create_task(
+                _run_pipelined_request(idx, req, pbar)
+            )
+        )
+
+    await asyncio.gather(*tasks)
+
+    benchmark_end_time = time.perf_counter()
+    total_duration = benchmark_end_time - benchmark_start_time
+
+    if pbar is not None:
+        pbar.close()
+
+    await session.close()
+
+    # ------------------------------------------------------------------ #
+    # Collect results in order                                             #
+    # ------------------------------------------------------------------ #
+    n = len(input_requests)
+    ordered_s1_texts: list[str] = [
+        stage1_texts.get(i, "") for i in range(n)
+    ]
+    ordered_s2_all_texts: list[list[str]] = []
+    stage2_origin_indices: list[int] = []
+    for i in range(n):
+        if i in stage2_all_texts_map and stage2_all_texts_map[i]:
+            ordered_s2_all_texts.append(stage2_all_texts_map[i])
+            stage2_origin_indices.append(i)
+
+    # Count completions
+    s1_completed = sum(
+        1 for o in stage1_outputs.values() if o.success
+    )
+    s2_completed = sum(
+        1 for o in stage2_outputs.values() if o.success
+    )
+
+    # Aggregate timing from individual outputs
+    s1_durations = [
+        o.latency for o in stage1_outputs.values() if o.success
+    ]
+    s2_durations = [
+        o.latency for o in stage2_outputs.values() if o.success
+    ]
+    avg_s1_latency = (
+        sum(s1_durations) / len(s1_durations) if s1_durations else 0.0
+    )
+    avg_s2_latency = (
+        sum(s2_durations) / len(s2_durations) if s2_durations else 0.0
+    )
+
+    # ------------------------------------------------------------------ #
+    # Evaluation                                                           #
+    # ------------------------------------------------------------------ #
+    eval_k_values = k_values if k_values else [1, 32]
+    eval_metrics: dict[str, Any] = {}
+
+    if ordered_s2_all_texts:
+        eval_metrics = evaluate_openopenrec(
+            input_requests=input_requests,
+            stage2_all_texts=ordered_s2_all_texts,
+            stage2_origin_indices=stage2_origin_indices,
+            k_values=eval_k_values,
+        )
+        logger.info(
+            "===== OpenOpenRec Distributed KVC Evaluation "
+            "(k_values={}) =====",
+            eval_k_values,
+        )
+        for k in eval_k_values:
+            logger.info(
+                "  pass@{}={:.4f}  position1_pass@{}={:.4f}  "
+                "recall@{}={:.4f}",
+                k, eval_metrics.get(f"pass@{k}", 0.0),
+                k, eval_metrics.get(f"position1_pass@{k}", 0.0),
+                k, eval_metrics.get(f"recall@{k}", 0.0),
+            )
+        logger.info(
+            "  evaluated={} / total={} (skipped: no_gt={}, no_gen={})",
+            eval_metrics.get("evaluated_samples", 0),
+            eval_metrics.get("total_samples", 0),
+            eval_metrics.get("skipped_no_groundtruth", 0),
+            eval_metrics.get("skipped_no_generation", 0),
+        )
+    else:
+        logger.warning(
+            "No stage-2 beam texts available – skipping evaluation."
+        )
+
+    # ------------------------------------------------------------------ #
+    # Combined summary                                                     #
+    # ------------------------------------------------------------------ #
+    total_completed = min(s1_completed, s2_completed)
+    print("\n" + "=" * 60)
+    print("{:^60}".format(
+        "OpenOpenRec Distributed KVC Pipelined Summary"
+    ))
+    print("=" * 60)
+    print("{:<45} {:<10}".format(
+        "Stage-1 completed:", s1_completed))
+    print("{:<45} {:<10.2f}".format(
+        "Avg stage-1 latency (s):", avg_s1_latency))
+    print("{:<45} {:<10}".format(
+        "Stage-2 completed:", s2_completed))
+    print("{:<45} {:<10.2f}".format(
+        "Avg stage-2 latency (s):", avg_s2_latency))
+    print("{:<45} {:<10.2f}".format(
+        "Total wall-clock duration (s):", total_duration))
+    print("{:<45} {:<10.2f}".format(
+        "End-to-end throughput (req/s):",
+        total_completed / total_duration if total_duration > 0 else 0,
+    ))
+    if eval_metrics:
+        print("-" * 60)
+        print("{:^60}".format("Evaluation Metrics"))
+        print("-" * 60)
+        for k in eval_k_values:
+            print("{:<45} {:<10.4f}".format(
+                f"pass@{k}:",
+                eval_metrics.get(f"pass@{k}", 0.0)))
+            print("{:<45} {:<10.4f}".format(
+                f"position1_pass@{k}:",
+                eval_metrics.get(f"position1_pass@{k}", 0.0)))
+            print("{:<45} {:<10.4f}".format(
+                f"recall@{k}:",
+                eval_metrics.get(f"recall@{k}", 0.0)))
+        print("{:<45} {}/{}".format(
+            "Evaluated / Total:",
+            eval_metrics.get("evaluated_samples", 0),
+            eval_metrics.get("total_samples", 0),
+        ))
+    print("=" * 60)
+
+    # Strip per_sample from top-level result
+    eval_per_sample = eval_metrics.pop("per_sample", {})
+
+    return {
+        "openopenrec_two_stage": True,
+        "distributed_kvc": True,
+        "stage1": {
+            "completed": s1_completed,
+            "avg_latency": avg_s1_latency,
+        },
+        "stage2": {
+            "completed": s2_completed,
+            "avg_latency": avg_s2_latency,
+        },
+        "total_duration": total_duration,
+        "total_completed": total_completed,
+        "total_throughput": (
+            total_completed / total_duration if total_duration > 0 else 0
+        ),
+        "evaluation": eval_metrics,
+        "evaluation_per_sample": eval_per_sample,
+    }
+
+
 def save_to_pytorch_benchmark_format(
     args: argparse.Namespace, results: dict[str, Any], file_name: str
 ) -> None:
@@ -2179,8 +2641,52 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         getattr(args, "dataset_name", None) == "openopenrec"
         and getattr(args, "openopenrec_enable_thinking", False)
     )
+    is_openopenrec_distributed_kvc = (
+        is_openopenrec_two_stage
+        and getattr(args, "openopenrec_distributed_kvc", False)
+    )
 
-    if is_openopenrec_two_stage:
+    if is_openopenrec_distributed_kvc:
+        # Pipelined two-stage with distributed KV cache sharing via APC
+        benchmark_result = await benchmark_openopenrec_two_stage_distributed_kvc(
+            task_type=task_type,
+            endpoint_type=backend,
+            base_url=base_url,
+            model_id=model_id,
+            model_name=model_name,
+            tokenizer=tokenizer,
+            input_requests=input_requests,
+            logprobs=args.logprobs,
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            disable_tqdm=args.disable_tqdm,
+            num_warmups=args.num_warmups,
+            profile=args.profile,
+            selected_percentile_metrics=percentile_metrics.split(","),
+            selected_percentiles=[
+                float(p) for p in args.metric_percentiles.split(",")
+            ],
+            ignore_eos=args.ignore_eos,
+            goodput_config_dict=goodput_config_dict,
+            max_concurrency=args.max_concurrency,
+            lora_modules=args.lora_modules,
+            extra_headers=headers,
+            ramp_up_strategy=args.ramp_up_strategy,
+            ramp_up_start_rps=args.ramp_up_start_rps,
+            ramp_up_end_rps=args.ramp_up_end_rps,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
+            prompt_token=args.openopenrec_prompt_token,
+            num_beams=args.openopenrec_num_beams,
+            max_new_tokens=args.openopenrec_max_new_tokens,
+            max_thinking_tokens=args.openopenrec_max_thinking_tokens,
+            num_return_thinking=args.openopenrec_num_return_thinking,
+            thinking_temperature=args.openopenrec_thinking_temperature,
+            thinking_top_p=args.openopenrec_thinking_top_p,
+            thinking_top_k=args.openopenrec_thinking_top_k,
+            k_values=[int(x) for x in args.openopenrec_k_values.split(",")],
+        )
+    elif is_openopenrec_two_stage:
+        # Sequential two-stage (original behaviour)
         benchmark_result = await benchmark_openopenrec_two_stage(
             task_type=task_type,
             endpoint_type=backend,

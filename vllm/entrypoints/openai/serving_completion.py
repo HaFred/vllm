@@ -215,6 +215,14 @@ class OpenAIServingCompletion(OpenAIServing):
                 # environments. It shouldn't be necessary (redundant from above)
                 # but pre-commit in CI fails without it.
                 engine_prompt = cast(EmbedsPrompt | TokensPrompt, engine_prompt)
+
+                # Continuation request: inherit KV cache from parent,
+                # skip full tokenisation / prefill of the shared prefix.
+                continuation_of = getattr(request, 'continuation_of', None)
+                continuation_suffix = getattr(
+                    request, 'continuation_suffix', None
+                )
+
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(
                         prompt=engine_prompt,
@@ -222,6 +230,26 @@ class OpenAIServingCompletion(OpenAIServing):
                         params=sampling_params,
                         lora_request=lora_request,
                         trace_headers=trace_headers,
+                        continuation_of=continuation_of,
+                        continuation_suffix=continuation_suffix,
+                    )
+                elif continuation_of is not None:
+                    # Tokenise only the small suffix, not the full prompt
+                    suffix_token_ids: list[int] = []
+                    if continuation_suffix and tokenizer is not None:
+                        suffix_token_ids = tokenizer.encode(
+                            continuation_suffix,
+                            add_special_tokens=False,
+                        )
+                    generator = self.engine_client.generate_continuation(
+                        parent_request_id=continuation_of,
+                        continuation_token_ids=suffix_token_ids,
+                        sampling_params=sampling_params,
+                        request_id=request_id_item,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
                     )
                 else:
                     engine_request, tokenization_kwargs = await self._process_inputs(

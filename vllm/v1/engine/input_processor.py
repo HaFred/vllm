@@ -599,6 +599,66 @@ class InputProcessor:
             trace_headers=trace_headers,
         )
 
+    def process_continuation(
+        self,
+        request_id: str,
+        parent_request_id: str,
+        continuation_token_ids: list[int],
+        params: SamplingParams,
+        arrival_time: float | None = None,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+    ) -> EngineCoreRequest:
+        """Create a continuation request that inherits KV cache from parent.
+
+        Skips tokenisation entirely. prompt_token_ids is set to None here
+        and will be populated by EngineCore.preprocess_add_request() from
+        the parent's all_token_ids + continuation_token_ids.
+        """
+        self._validate_lora(lora_request)
+        self._validate_params(params)
+
+        data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        if data_parallel_rank is not None and not (
+            0 <= data_parallel_rank < data_parallel_size
+        ):
+            raise ValueError(
+                f"data_parallel_rank {data_parallel_rank} "
+                f"is out of range [0, {data_parallel_size})."
+            )
+
+        if arrival_time is None:
+            arrival_time = time.time()
+
+        sampling_params = params.clone()
+        eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
+        if sampling_params.max_tokens is None:
+            sampling_params.max_tokens = self.model_config.max_model_len
+        sampling_params.update_from_generation_config(
+            self.generation_config_fields, eos_token_id
+        )
+        if self.tokenizer is not None:
+            sampling_params.update_from_tokenizer(self.tokenizer)
+
+        return EngineCoreRequest(
+            request_id=request_id,
+            prompt_token_ids=None,  # filled by EngineCore from parent
+            mm_features=None,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            eos_token_id=eos_token_id,
+            arrival_time=arrival_time,
+            lora_request=lora_request,
+            cache_salt=None,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+            trace_headers=trace_headers,
+            continuation_of=parent_request_id,
+            continuation_token_ids=continuation_token_ids,
+        )
+
     def _validate_model_inputs(
         self, encoder_inputs: SingletonInputs | None, decoder_inputs: SingletonInputs
     ):

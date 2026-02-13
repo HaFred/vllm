@@ -1596,6 +1596,14 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         help="Comma-separated k values for evaluation metrics "
         "(pass@k, position1_pass@k, recall@k). Default: '1,32'.",
     )
+    openopenrec_group.add_argument(
+        "--openopenrec-distributed-kvc",
+        action="store_true",
+        help="Enable distributed KV cache mode: pipeline stage 1 and "
+        "stage 2 per-request so that stage 2 reuses the KV cache from "
+        "stage 1 via automatic prefix caching (APC). Requires the vLLM "
+        "server to have prefix caching enabled.",
+    )
 
     spec_bench_group = parser.add_argument_group("spec bench dataset options")
     spec_bench_group.add_argument(
