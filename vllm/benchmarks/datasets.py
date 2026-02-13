@@ -1589,6 +1589,13 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         default=50,
         help="Top-k for stage-1 thinking sampling.",
     )
+    openopenrec_group.add_argument(
+        "--openopenrec-k-values",
+        type=str,
+        default="1,32",
+        help="Comma-separated k values for evaluation metrics "
+        "(pass@k, position1_pass@k, recall@k). Default: '1,32'.",
+    )
 
     spec_bench_group = parser.add_argument_group("spec bench dataset options")
     spec_bench_group.add_argument(

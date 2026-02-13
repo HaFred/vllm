@@ -1128,6 +1128,190 @@ def parse_goodput(slo_pairs):
 
 
 # ---------------------------------------------------------------------------
+# OpenOpenRec evaluation utilities
+# ---------------------------------------------------------------------------
+# Metric computation functions copied from
+#   OpenOneRec/benchmarks/benchmark/tasks/v1_0/recommendation/utils.py
+# to keep vllm_genrec self-contained.  The logic is intentionally identical.
+
+
+def _extract_ids_from_answer(answer: str) -> set[str]:
+    """Extract all SIDs from answer field.
+
+    >>> _extract_ids_from_answer("<|sid_begin|>123<|sid_end|><|sid_begin|>456<|sid_end|>")
+    {'123', '456'}
+    """
+    correct_answers: set[str] = set()
+    for part in answer.split('<|sid_begin|>'):
+        if '<|sid_end|>' in part:
+            sid = part.split('<|sid_end|>')[0].strip()
+            if sid:
+                correct_answers.add(sid)
+    return correct_answers
+
+
+def _extract_first_id_from_answer(answer: str) -> str:
+    """Extract the first SID from answer field."""
+    for part in answer.split('<|sid_begin|>'):
+        if '<|sid_end|>' in part:
+            sid = part.split('<|sid_end|>')[0].strip()
+            if sid:
+                return sid
+    return ""
+
+
+def _extract_id_from_generation(generation: str) -> str:
+    """Extract SID from a single model generation string."""
+    generation = generation.strip()
+
+    # If generation contains </think>, only process content after it
+    if '</think>' in generation:
+        generation = generation.split('</think>')[-1].strip()
+
+    # Try to extract from <|sid_begin|>...<|sid_end|> pattern
+    if '<|sid_begin|>' in generation:
+        for part in generation.split('<|sid_begin|>'):
+            if '<|sid_end|>' in part:
+                sid = part.split('<|sid_end|>')[0].strip()
+                if sid:
+                    return sid
+            elif part.strip():  # No end marker, take the content after begin marker
+                return part.strip()
+
+    # Otherwise, return the stripped generation
+    return generation
+
+
+def _compute_pass_at_k(
+    predicted_sids: list[str],
+    ground_truth_sids: set[str],
+    k: int,
+) -> bool:
+    """Pass@k: True if any of the first *k* predicted SIDs is in ground truth."""
+    if not predicted_sids or not ground_truth_sids:
+        return False
+    top_k_sids = predicted_sids[:k]
+    for sid in top_k_sids:
+        if sid in ground_truth_sids:
+            return True
+    return False
+
+
+def _compute_position1_pass_at_k(
+    predicted_sids: list[str],
+    first_ground_truth_sid: str,
+    k: int,
+) -> bool:
+    """Position1_Pass@k: True if any of the first *k* predicted SIDs matches
+    the *first* ground-truth SID."""
+    if not predicted_sids or not first_ground_truth_sid:
+        return False
+    top_k_sids = predicted_sids[:k]
+    for sid in top_k_sids:
+        if sid == first_ground_truth_sid:
+            return True
+    return False
+
+
+def _compute_recall_at_k(
+    predicted_sids: list[str],
+    ground_truth_sids: set[str],
+    k: int,
+) -> float:
+    """Recall@k: fraction of ground-truth SIDs found in the first *k* predictions."""
+    if not predicted_sids or not ground_truth_sids:
+        return 0.0
+    top_k_sids = predicted_sids[:k]
+    predicted_sids_set = set(sid for sid in top_k_sids if sid)
+    hit_count = len(predicted_sids_set & ground_truth_sids)
+    recall = hit_count / len(ground_truth_sids)
+    return recall
+
+
+def evaluate_openopenrec(
+    input_requests: list[SampleRequest],
+    stage2_all_texts: list[list[str]],
+    stage2_origin_indices: list[int],
+    k_values: list[int],
+) -> dict[str, Any]:
+    """Compute pass@k, position1_pass@k, recall@k for OpenOpenRec stage-2 outputs.
+
+    Uses exactly the same metric logic as
+    ``OpenOneRec/benchmarks/benchmark/tasks/v1_0/recommendation/evaluator.py``.
+
+    Returns a dict with overall metrics **and** a ``per_sample`` sub-dict.
+    """
+    total = len(input_requests)
+
+    pass_counts = {k: 0 for k in k_values}
+    pos1_pass_counts = {k: 0 for k in k_values}
+    recall_sums = {k: 0.0 for k in k_values}
+    evaluated = 0
+    skipped_no_gt = 0
+    skipped_no_gen = 0
+    per_sample: dict[str, dict[str, Any]] = {}
+
+    for s2_idx in range(len(stage2_origin_indices)):
+        orig_idx = stage2_origin_indices[s2_idx]
+        orig_req = input_requests[orig_idx]
+        groundtruth = orig_req.groundtruth or ""
+        sample_id = orig_req.request_id or str(orig_idx)
+
+        ground_truth_ids = _extract_ids_from_answer(groundtruth)
+        first_gt_id = _extract_first_id_from_answer(groundtruth)
+
+        if not ground_truth_ids:
+            skipped_no_gt += 1
+            continue
+
+        beams: list[str] = (
+            stage2_all_texts[s2_idx]
+            if s2_idx < len(stage2_all_texts)
+            else []
+        )
+
+        if not beams:
+            skipped_no_gen += 1
+            continue
+
+        # Extract predicted SIDs from beam outputs
+        predicted_sids = [_extract_id_from_generation(b) for b in beams]
+
+        sample_metrics: dict[str, Any] = {}
+        for k in k_values:
+            p = _compute_pass_at_k(predicted_sids, ground_truth_ids, k)
+            p1 = _compute_position1_pass_at_k(predicted_sids, first_gt_id, k)
+            r = _compute_recall_at_k(predicted_sids, ground_truth_ids, k)
+            sample_metrics[f"pass@{k}"] = p
+            sample_metrics[f"position1_pass@{k}"] = p1
+            sample_metrics[f"recall@{k}"] = r
+            if p:
+                pass_counts[k] += 1
+            if p1:
+                pos1_pass_counts[k] += 1
+            recall_sums[k] += r
+
+        per_sample[sample_id] = sample_metrics
+        evaluated += 1
+
+    # Aggregate
+    metrics: dict[str, Any] = {
+        "total_samples": total,
+        "evaluated_samples": evaluated,
+        "skipped_no_groundtruth": skipped_no_gt,
+        "skipped_no_generation": skipped_no_gen,
+    }
+    for k in k_values:
+        denom = evaluated if evaluated > 0 else 1
+        metrics[f"pass@{k}"] = pass_counts[k] / denom
+        metrics[f"position1_pass@{k}"] = pos1_pass_counts[k] / denom
+        metrics[f"recall@{k}"] = recall_sums[k] / denom
+
+    metrics["per_sample"] = per_sample
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # OpenOpenRec two-stage benchmark
 # ---------------------------------------------------------------------------
 
@@ -1168,6 +1352,8 @@ async def benchmark_openopenrec_two_stage(
     thinking_temperature: float,
     thinking_top_p: float,
     thinking_top_k: int,
+    # evaluation
+    k_values: list[int] | None = None,
 ) -> dict[str, Any]:
     """Run the OpenOneRec two-stage benchmark.
 
@@ -1373,6 +1559,42 @@ async def benchmark_openopenrec_two_stage(
             )
 
     # ------------------------------------------------------------------ #
+    # Evaluation                                                           #
+    # ------------------------------------------------------------------ #
+    eval_k_values = k_values if k_values else [1, 32]
+    eval_metrics: dict[str, Any] = {}
+
+    if stage2_all_texts:
+        eval_metrics = evaluate_openopenrec(
+            input_requests=input_requests,
+            stage2_all_texts=stage2_all_texts,
+            stage2_origin_indices=stage2_origin_indices,
+            k_values=eval_k_values,
+        )
+        logger.info(
+            "===== OpenOpenRec Evaluation (k_values={}) =====",
+            eval_k_values,
+        )
+        for k in eval_k_values:
+            logger.info(
+                "  pass@{}={:.4f}  position1_pass@{}={:.4f}  recall@{}={:.4f}",
+                k, eval_metrics.get(f"pass@{k}", 0.0),
+                k, eval_metrics.get(f"position1_pass@{k}", 0.0),
+                k, eval_metrics.get(f"recall@{k}", 0.0),
+            )
+        logger.info(
+            "  evaluated={} / total={} (skipped: no_gt={}, no_gen={})",
+            eval_metrics.get("evaluated_samples", 0),
+            eval_metrics.get("total_samples", 0),
+            eval_metrics.get("skipped_no_groundtruth", 0),
+            eval_metrics.get("skipped_no_generation", 0),
+        )
+    else:
+        logger.warning(
+            "No stage-2 beam texts available – skipping evaluation."
+        )
+
+    # ------------------------------------------------------------------ #
     # Combined summary                                                    #
     # ------------------------------------------------------------------ #
     total_duration = stage1_result["duration"] + stage2_result["duration"]
@@ -1392,7 +1614,27 @@ async def benchmark_openopenrec_two_stage(
         "End-to-end throughput (req/s):",
         total_completed / total_duration if total_duration > 0 else 0,
     ))
+    if eval_metrics:
+        print("-" * 60)
+        print("{:^60}".format("Evaluation Metrics"))
+        print("-" * 60)
+        for k in eval_k_values:
+            print("{:<45} {:<10.4f}".format(
+                f"pass@{k}:", eval_metrics.get(f"pass@{k}", 0.0)))
+            print("{:<45} {:<10.4f}".format(
+                f"position1_pass@{k}:", eval_metrics.get(f"position1_pass@{k}", 0.0)))
+            print("{:<45} {:<10.4f}".format(
+                f"recall@{k}:", eval_metrics.get(f"recall@{k}", 0.0)))
+        print("{:<45} {}/{}".format(
+            "Evaluated / Total:",
+            eval_metrics.get("evaluated_samples", 0),
+            eval_metrics.get("total_samples", 0),
+        ))
     print("=" * 60)
+
+    # Strip per_sample from top-level result to avoid bloating saved JSON;
+    # keep it under a separate key so --save-detailed can retain it.
+    eval_per_sample = eval_metrics.pop("per_sample", {})
 
     # Return a merged result dict for JSON saving
     return {
@@ -1402,6 +1644,8 @@ async def benchmark_openopenrec_two_stage(
         "total_duration": total_duration,
         "total_completed": total_completed,
         "total_throughput": total_completed / total_duration if total_duration > 0 else 0,
+        "evaluation": eval_metrics,
+        "evaluation_per_sample": eval_per_sample,
     }
 
 
@@ -1972,6 +2216,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             thinking_temperature=args.openopenrec_thinking_temperature,
             thinking_top_p=args.openopenrec_thinking_top_p,
             thinking_top_k=args.openopenrec_thinking_top_k,
+            k_values=[int(x) for x in args.openopenrec_k_values.split(",")],
         )
     else:
         benchmark_result = await benchmark(
@@ -2053,6 +2298,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             "itls",
             "generated_texts",
             "errors",
+            "evaluation_per_sample",
         ]:
             if field in result_json:
                 del result_json[field]

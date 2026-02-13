@@ -48,5 +48,6 @@ NUM_PROMPTS=${NUM_PROMPTS:-1000}
   --openopenrec-thinking-top-p "${THINKING_TOP_P:-0.95}" \
   --openopenrec-thinking-top-k "${THINKING_TOP_K:-50}" \
   --openopenrec-prompt-token "${PROMPT_TOKEN:-<|sid_begin|>}" \
+  --openopenrec-k-values "${K_VALUES:-1,32}" \
   --save-detailed \
   --ready-check-timeout-sec 120
