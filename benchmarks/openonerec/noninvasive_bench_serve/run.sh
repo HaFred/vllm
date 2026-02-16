@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Non-invasive two-stage OpenOneRec benchmark using offline vLLM (no server).
+# Non-invasive two-stage OpenOneRec benchmark against a running vllm serve.
 #
 # Mirrors the generation pipeline in
 #   vllm_genrec/vllm/benchmarks/serve.py (benchmark_openopenrec_two_stage)
-# but uses `import vllm` directly with vllm.LLM instead of HTTP API.
+# but uses HTTP API only — no modifications to vLLM source.
 #
-#   Stage 1: sampling to generate thinking (stop at </think>)
-#   Stage 2: beam search with prompt_token (<|sid_begin|>) for SID generation
+#   Stage 1: streaming sampling to generate thinking (stop at </think>)
+#   Stage 2: non-streaming beam search with prompt_token (<|sid_begin|>)
+#
+# Prerequisites:
+#   1) Start a vLLM server:
+#        vllm serve <model> --max-logprobs 64 [engine args]
+#   2) Run this script.
 #
 # Usage:
-#   MODEL=/path/to/model DATASET_PATH=/path/to/data ./run.sh
+#   MODEL=<model_name> DATASET_PATH=/path/to/data ./run.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MODEL=${MODEL:?"MODEL must be set (model name or path)"}
+MODEL=${MODEL:?"MODEL must be set (model name served by vLLM)"}
 DATASET_PATH=${DATASET_PATH:?"DATASET_PATH must be set (parquet file or directory)"}
 TOKENIZER=${TOKENIZER:-"$MODEL"}
+HOST=${HOST:-"127.0.0.1"}
+PORT=${PORT:-8000}
 NUM_PROMPTS=${NUM_PROMPTS:-1000}
 
 python "$SCRIPT_DIR/bench.py" \
+  --host "$HOST" \
+  --port "$PORT" \
   --model "$MODEL" \
   --tokenizer "$TOKENIZER" \
   --trust-remote-code \
@@ -36,9 +45,7 @@ python "$SCRIPT_DIR/bench.py" \
   --thinking-top-k "${THINKING_TOP_K:-50}" \
   --prompt-token "${PROMPT_TOKEN:-<|sid_begin|>}" \
   --k-values "${K_VALUES:-1,32}" \
-  --tensor-parallel-size "${TP_SIZE:-1}" \
-  --gpu-memory-utilization "${GPU_MEM_UTIL:-0.90}" \
-  ${ENABLE_PREFIX_CACHING:+--enable-prefix-caching} \
+  --max-concurrent "${MAX_CONCURRENT:-64}" \
   --save-result \
   --save-detailed \
   ${RESULT_DIR:+--result-dir "$RESULT_DIR"}
