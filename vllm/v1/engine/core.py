@@ -5,7 +5,7 @@ import queue
 import signal
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
@@ -209,6 +209,13 @@ class EngineCore:
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
+
+        # Continuation support: bounded cache of recently-finished requests'
+        # all_token_ids so that continuation requests can reconstruct their
+        # prompt_token_ids from the parent without re-tokenisation.
+        self._finished_request_tokens: OrderedDict[str, list[int]] = OrderedDict()
+        self._max_finished_token_cache = 1024
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -396,6 +403,12 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # Cache token IDs of finished requests for continuation support.
+        # Must be done before the next schedule() call which clears
+        # finished_req_ids and may free the request objects.
+        for req_id in self.scheduler.finished_req_ids:
+            self.cache_finished_request_tokens(req_id)
+
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -497,6 +510,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+
+        # Cache token IDs of finished requests for continuation support.
+        for req_id in self.scheduler.finished_req_ids:
+            self.cache_finished_request_tokens(req_id)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -609,12 +626,56 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def cache_finished_request_tokens(self, req_id: str) -> None:
+        """Cache token IDs of a finished request for continuation support."""
+        req = self.scheduler.requests.get(req_id)
+        if req is not None and req._all_token_ids:
+            self._finished_request_tokens[req_id] = list(req._all_token_ids)
+            # Evict oldest if over capacity
+            while len(self._finished_request_tokens) > self._max_finished_token_cache:
+                self._finished_request_tokens.popitem(last=False)
+
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        # Handle continuation requests: build prompt_token_ids from parent.
+        if getattr(request, 'continuation_of', None) is not None:
+            parent_tokens = None
+
+            # Try 1: parent is still running/waiting in the scheduler
+            parent_req = self.scheduler.requests.get(request.continuation_of)
+            if parent_req is not None:
+                parent_tokens = list(parent_req._all_token_ids)
+
+            # Try 2: parent recently finished — look up in cache
+            if parent_tokens is None:
+                parent_tokens = self._finished_request_tokens.get(
+                    request.continuation_of
+                )
+
+            if parent_tokens is None:
+                raise ValueError(
+                    f"Continuation parent request '{request.continuation_of}' "
+                    f"not found in running requests or finished cache. "
+                    f"Ensure the parent request has not been evicted."
+                )
+
+            # Build the full prompt_token_ids
+            suffix = request.continuation_token_ids or []
+            request.prompt_token_ids = parent_tokens + suffix
+            logger.debug(
+                "Continuation request %s: inherited %d tokens from parent "
+                "%s, appended %d suffix tokens -> total %d prompt tokens",
+                request.request_id,
+                len(parent_tokens),
+                request.continuation_of,
+                len(suffix),
+                len(request.prompt_token_ids),
+            )
+
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.

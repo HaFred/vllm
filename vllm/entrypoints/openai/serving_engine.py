@@ -312,6 +312,8 @@ class OpenAIServing:
         params: BeamSearchParams,
         lora_request: LoRARequest | None = None,
         trace_headers: Mapping[str, str] | None = None,
+        continuation_of: str | None = None,
+        continuation_suffix: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens
@@ -379,6 +381,14 @@ class OpenAIServing:
         ]
         completed = []
 
+        # Tokenise the continuation suffix once for the first step.
+        _continuation_suffix_ids: list[int] | None = None
+        if continuation_of is not None and continuation_suffix is not None:
+            _continuation_suffix_ids = tokenizer.encode(
+                continuation_suffix, add_special_tokens=False
+            )
+
+        is_first_step = True
         for _ in range(max_tokens):
             prompts_batch, lora_req_batch = zip(
                 *[
@@ -401,18 +411,42 @@ class OpenAIServing:
                 zip(prompts_batch, lora_req_batch)
             ):
                 request_id_item = f"{request_id_batch}-beam-{i}"
-                task = asyncio.create_task(
-                    collect_from_async_generator(
-                        self.engine_client.generate(
-                            individual_prompt,
-                            beam_search_params,
-                            request_id_item,
-                            lora_request=lora_req,
-                            trace_headers=trace_headers,
+
+                # First step, first beam: use continuation to inherit KVC
+                if (
+                    is_first_step
+                    and i == 0
+                    and continuation_of is not None
+                ):
+                    task = asyncio.create_task(
+                        collect_from_async_generator(
+                            self.engine_client.generate_continuation(
+                                parent_request_id=continuation_of,
+                                continuation_token_ids=(
+                                    _continuation_suffix_ids or []
+                                ),
+                                sampling_params=beam_search_params,
+                                request_id=request_id_item,
+                                lora_request=lora_req,
+                                trace_headers=trace_headers,
+                            )
                         )
                     )
-                )
+                else:
+                    task = asyncio.create_task(
+                        collect_from_async_generator(
+                            self.engine_client.generate(
+                                individual_prompt,
+                                beam_search_params,
+                                request_id_item,
+                                lora_request=lora_req,
+                                trace_headers=trace_headers,
+                            )
+                        )
+                    )
                 tasks.append(task)
+
+            is_first_step = False
 
             output = [x[0] for x in await asyncio.gather(*tasks)]
 
