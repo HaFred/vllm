@@ -288,7 +288,10 @@ async def _send_streaming_completion(
                 output.generated_text = generated_text
                 output.latency = most_recent_timestamp - st
             else:
-                output.error = f"HTTP {response.status}: {response.reason}"
+                error_body = await response.text()
+                output.error = (
+                    f"HTTP {response.status}: {response.reason}\n{error_body[:500]}"
+                )
                 output.success = False
     except Exception:
         output.success = False
@@ -336,13 +339,40 @@ async def _send_beam_search_completion(
                     approx_itl = output.latency / output.output_tokens
                     output.itl = [approx_itl] * (output.output_tokens - 1)
             else:
-                output.error = f"HTTP {response.status}: {response.reason}"
+                error_body = await response.text()
+                output.error = (
+                    f"HTTP {response.status}: {response.reason}\n{error_body[:500]}"
+                )
                 output.success = False
     except Exception:
         output.success = False
         output.error = "".join(traceback.format_exception(*sys.exc_info()))
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Rate-limited dispatch helper
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch_with_rate(
+    coroutines: list,
+    rps: float,
+    sem: asyncio.Semaphore,
+) -> list:
+    """Launch coroutines with rate limiting (requests per second).
+
+    Each coroutine is wrapped with the semaphore for concurrency control.
+    If *rps* is ``inf``, all coroutines are launched immediately.
+    Otherwise they are staggered with ``1/rps`` second delays.
+    """
+    tasks: list[asyncio.Task] = []
+    for i, coro in enumerate(coroutines):
+        tasks.append(asyncio.create_task(coro))
+        if rps != float("inf") and i < len(coroutines) - 1:
+            await asyncio.sleep(1.0 / rps)
+    return await asyncio.gather(*tasks)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +391,7 @@ async def run_stage1(
     top_p: float,
     top_k: int,
     max_concurrent: int,
+    rps: float = float("inf"),
 ) -> tuple[list[RequestOutput], float]:
     """Send stage-1 streaming requests with stop=["</think>"]."""
     sem = asyncio.Semaphore(max_concurrent)
@@ -386,23 +417,31 @@ async def run_stage1(
             pbar.update(1)
             return result
 
+    rps_str = "inf" if rps == float("inf") else f"{rps:.1f}"
     print(f"\n{'='*60}")
     print("Stage 1/2: Thinking (sampling)")
     print(f"  n={num_return_thinking}, max_tokens={max_thinking_tokens}, "
           f"temp={temperature}, top_p={top_p}, top_k={top_k}, "
           f"stop=['</think>']")
-    print(f"  prompts={len(samples)}, max_concurrent={max_concurrent}")
+    print(f"  prompts={len(samples)}, max_concurrent={max_concurrent}, "
+          f"rps={rps_str}")
     print(f"{'='*60}")
 
     pbar = tqdm(total=len(samples), desc="Stage 1 (thinking)")
     t0 = time.perf_counter()
-    tasks = [asyncio.create_task(_send(s)) for s in samples]
-    outputs: list[RequestOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestOutput] = await _dispatch_with_rate(
+        [_send(s) for s in samples], rps, sem,
+    )
     elapsed = time.perf_counter() - t0
     pbar.close()
 
     completed = sum(1 for o in outputs if o.success)
+    failed_outputs = [o for o in outputs if not o.success]
     print(f"\nStage 1 done: {completed}/{len(samples)} samples, {elapsed:.2f}s")
+    if failed_outputs:
+        print(f"Stage 1 failed requests: {len(failed_outputs)} (showing up to 10):")
+        for i, o in enumerate(failed_outputs[:10]):
+            print(f"  Error {i}: {o.error[:300]}")
 
     return outputs, elapsed
 
@@ -421,6 +460,7 @@ async def run_stage2(
     num_beams: int,
     max_new_tokens: int,
     max_concurrent: int,
+    rps: float = float("inf"),
 ) -> tuple[list[RequestOutput], float]:
     """Send stage-2 non-streaming beam search requests."""
     sem = asyncio.Semaphore(max_concurrent)
@@ -442,24 +482,30 @@ async def run_stage2(
             pbar.update(1)
             return result
 
+    rps_str = "inf" if rps == float("inf") else f"{rps:.1f}"
     print(f"\n{'='*60}")
     print("Stage 2/2: Beam search")
     print(f"  num_beams={num_beams}, max_tokens={max_new_tokens}")
-    print(f"  candidates={len(stage2_prompts)}, max_concurrent={max_concurrent}")
+    print(f"  candidates={len(stage2_prompts)}, max_concurrent={max_concurrent}, "
+          f"rps={rps_str}")
     print(f"{'='*60}")
 
     pbar = tqdm(total=len(stage2_prompts), desc="Stage 2 (beam search)")
     t0 = time.perf_counter()
-    tasks = [
-        asyncio.create_task(_send(p, pl))
-        for p, pl in zip(stage2_prompts, stage2_prompt_lens)
-    ]
-    outputs: list[RequestOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestOutput] = await _dispatch_with_rate(
+        [_send(p, pl) for p, pl in zip(stage2_prompts, stage2_prompt_lens)],
+        rps, sem,
+    )
     elapsed = time.perf_counter() - t0
     pbar.close()
 
     completed = sum(1 for o in outputs if o.success)
+    failed_outputs = [o for o in outputs if not o.success]
     print(f"\nStage 2 done: {completed}/{len(stage2_prompts)} candidates, {elapsed:.2f}s")
+    if failed_outputs:
+        print(f"Stage 2 failed requests: {len(failed_outputs)} (showing up to 10):")
+        for i, o in enumerate(failed_outputs[:10]):
+            print(f"  Error {i}: {o.error[:500]}")
 
     return outputs, elapsed
 
@@ -479,6 +525,7 @@ async def run_single_stage(
     max_new_tokens: int,
     tokenizer,
     max_concurrent: int,
+    rps: float = float("inf"),
 ) -> tuple[list[RequestOutput], list[int], float]:
     """Single-stage beam search (prompt_token appended, no thinking)."""
     prompts = [s.prompt + prompt_token for s in samples]
@@ -492,6 +539,7 @@ async def run_single_stage(
         num_beams=num_beams,
         max_new_tokens=max_new_tokens,
         max_concurrent=max_concurrent,
+        rps=rps,
     )
     return outputs, origin_indices, elapsed
 
@@ -542,9 +590,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt-token", type=str, default="<|sid_begin|>",
                    help="Token appended before beam search generation")
 
-    # Concurrency
+    # Concurrency / rate
     p.add_argument("--max-concurrent", type=int, default=64,
                    help="Max concurrent HTTP requests")
+    p.add_argument("--rps", type=float, default=float("inf"),
+                   help="Requests per second (constant rate). "
+                   "Default: inf (no rate limit, only concurrency-limited). "
+                   "Equivalent to vllm bench serve --ramp-up-start-rps X "
+                   "--ramp-up-end-rps X.")
 
     # Evaluation
     p.add_argument("--k-values", type=str, default="1,32",
@@ -572,6 +625,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+async def _preflight_check(base_url: str, num_beams: int) -> None:
+    """Verify server is reachable and warn about max_logprobs requirement."""
+    required_logprobs = 2 * num_beams
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(f"{base_url}/v1/models", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    print(f"WARNING: Server at {base_url} returned HTTP {resp.status}. "
+                          f"Is vllm serve running?")
+                    return
+                print(f"Server    : {base_url} (reachable)")
+    except Exception as e:
+        print(f"ERROR: Cannot reach server at {base_url}: {e}")
+        print("       Start the server first:  vllm serve <model> "
+              f"--max-logprobs {required_logprobs}")
+        sys.exit(1)
+
+    if required_logprobs > 20:
+        print(f"NOTE: Beam search with num_beams={num_beams} requires the server "
+              f"to be started with --max-logprobs {required_logprobs} (or higher).\n"
+              f"      Default is 20. If stage 2 gets HTTP 400 errors, restart "
+              f"the server with:  vllm serve <model> --max-logprobs {required_logprobs}")
+
+
 async def main_async():
     args = parse_args()
 
@@ -583,11 +660,15 @@ async def main_async():
     selected_percentile_metrics = args.percentile_metrics.split(",")
 
     # ------------------------------------------------------------------ #
+    # Preflight: check server reachability + max_logprobs warning          #
+    # ------------------------------------------------------------------ #
+    await _preflight_check(base_url, args.num_beams)
+
+    # ------------------------------------------------------------------ #
     # Load tokenizer + dataset                                             #
     # ------------------------------------------------------------------ #
     from transformers import AutoTokenizer
 
-    print(f"Server    : {base_url}")
     print(f"Tokenizer : {tokenizer_name}")
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_name, trust_remote_code=args.trust_remote_code
@@ -628,7 +709,7 @@ async def main_async():
             s2_outputs, origin_indices, stage2_time = await run_single_stage(
                 session, completions_url, args.model, samples,
                 args.prompt_token, args.num_beams, args.max_new_tokens,
-                tokenizer, args.max_concurrent,
+                tokenizer, args.max_concurrent, args.rps,
             )
             stage1_outputs: list[RequestOutput] = []
             stage1_time = 0.0
@@ -642,6 +723,7 @@ async def main_async():
                 top_p=args.thinking_top_p,
                 top_k=args.thinking_top_k,
                 max_concurrent=args.max_concurrent,
+                rps=args.rps,
             )
 
             # Log stage-1 output
@@ -676,6 +758,7 @@ async def main_async():
                 num_beams=args.num_beams,
                 max_new_tokens=args.max_new_tokens,
                 max_concurrent=args.max_concurrent,
+                rps=args.rps,
             )
 
         # Log stage-2 beams

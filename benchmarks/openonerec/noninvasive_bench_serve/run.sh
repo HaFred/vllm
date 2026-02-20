@@ -11,8 +11,9 @@ set -euo pipefail
 #   Stage 2: non-streaming beam search with prompt_token (<|sid_begin|>)
 #
 # Prerequisites:
-#   1) Start a vLLM server:
+#   1) Start a vLLM server with --max-logprobs >= 2 * NUM_BEAMS (default 64):
 #        vllm serve <model> --max-logprobs 64 [engine args]
+#      (vLLM default max_logprobs=20 is too low for beam search with 32 beams)
 #   2) Run this script.
 #
 # Usage:
@@ -46,6 +47,7 @@ python "$SCRIPT_DIR/bench.py" \
   --prompt-token "${PROMPT_TOKEN:-<|sid_begin|>}" \
   --k-values "${K_VALUES:-1,32}" \
   --max-concurrent "${MAX_CONCURRENT:-64}" \
+  --rps "${RPS:-inf}" \
   --save-result \
   --save-detailed \
   ${RESULT_DIR:+--result-dir "$RESULT_DIR"}
