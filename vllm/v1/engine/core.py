@@ -216,6 +216,14 @@ class EngineCore:
         self._finished_request_tokens: OrderedDict[str, list[int]] = OrderedDict()
         self._max_finished_token_cache = 1024
 
+        # Bidirectional mapping between external and internal request IDs.
+        # Keys and values are both request IDs; each pair is stored twice
+        # (ext→int and int→ext) so lookups work from either direction.
+        # Needed so that:
+        #   - continuation_of (external ID from client) resolves to internal
+        #   - cache_finished_request_tokens (internal ID) finds external ID
+        self._req_id_bimap: dict[str, str] = {}
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -322,6 +330,14 @@ class EngineCore:
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
+
+        # Cache tokens of aborted requests for continuation support.
+        # This is needed when a stop STRING (not stop token ID) triggers
+        # the abort via the detokenizer — the request never goes through
+        # the normal "finished" path, so cache_finished_request_tokens
+        # wouldn't be called otherwise.
+        for req_id in request_ids:
+            self.cache_finished_request_tokens(req_id)
 
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
@@ -627,10 +643,20 @@ class EngineCore:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
     def cache_finished_request_tokens(self, req_id: str) -> None:
-        """Cache token IDs of a finished request for continuation support."""
+        """Cache token IDs of a finished request for continuation support.
+
+        Caches by both internal request_id and external_req_id so that
+        continuation_of lookups work regardless of which ID the client uses.
+        """
         req = self.scheduler.requests.get(req_id)
         if req is not None and req._all_token_ids:
-            self._finished_request_tokens[req_id] = list(req._all_token_ids)
+            tokens = list(req._all_token_ids)
+            self._finished_request_tokens[req_id] = tokens
+            # Also cache by external request ID (the one the HTTP client knows)
+            ext_id = self._req_id_bimap.pop(req_id, None)
+            if ext_id is not None:
+                self._req_id_bimap.pop(ext_id, None)
+                self._finished_request_tokens[ext_id] = tokens
             # Evict oldest if over capacity
             while len(self._finished_request_tokens) > self._max_finished_token_cache:
                 self._finished_request_tokens.popitem(last=False)
@@ -641,16 +667,32 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        # Record bidirectional external ↔ internal request ID mapping.
+        if getattr(request, 'external_req_id', None) is not None:
+            self._req_id_bimap[request.external_req_id] = request.request_id
+            self._req_id_bimap[request.request_id] = request.external_req_id
+
         # Handle continuation requests: build prompt_token_ids from parent.
         if getattr(request, 'continuation_of', None) is not None:
             parent_tokens = None
 
             # Try 1: parent is still running/waiting in the scheduler
             parent_req = self.scheduler.requests.get(request.continuation_of)
+            if parent_req is None:
+                # The continuation_of might be an external_req_id; resolve it.
+                internal_id = self._req_id_bimap.get(
+                    request.continuation_of
+                )
+                if internal_id is not None:
+                    parent_req = self.scheduler.requests.get(internal_id)
             if parent_req is not None:
                 parent_tokens = list(parent_req._all_token_ids)
+                # Rewrite continuation_of to the internal request ID so that
+                # downstream block transfer (req_to_blocks) works correctly.
+                request.continuation_of = parent_req.request_id
 
             # Try 2: parent recently finished — look up in cache
+            # (works with both internal and external IDs since both are cached)
             if parent_tokens is None:
                 parent_tokens = self._finished_request_tokens.get(
                     request.continuation_of
