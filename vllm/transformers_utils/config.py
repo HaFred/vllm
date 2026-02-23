@@ -45,10 +45,19 @@ try:
     # Transformers v5
     from transformers.configuration_utils import ALLOWED_ATTENTION_LAYER_TYPES
 except ImportError:
-    # Transformers v4
-    from transformers.configuration_utils import (
-        ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES,
-    )
+    try:
+        # Transformers v4.53+
+        from transformers.configuration_utils import (
+            ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES,
+        )
+    except ImportError:
+        # Transformers < v4.53 (e.g. v4.52.4)
+        ALLOWED_ATTENTION_LAYER_TYPES = (
+            "full_attention",
+            "sliding_attention",
+            "chunked_attention",
+            "linear_attention",
+        )
 
 
 if envs.VLLM_USE_MODELSCOPE:

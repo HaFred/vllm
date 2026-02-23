@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import functools
 import importlib.metadata
 import os
 import random
+import sys
 import threading
+import types as _builtin_types
 from collections.abc import Callable, Collection
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import (TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional,
+                    Set, Tuple, TypeVar, Union)
 
 import numpy as np
 import numpy.typing as npt
@@ -728,6 +732,72 @@ def supports_custom_op() -> bool:
 vllm_lib = Library("vllm", "FRAGMENT")  # noqa
 
 
+# Mapping from Python 3.10+ builtin generic types to typing equivalents,
+# needed for PyTorch infer_schema compatibility with older PyTorch versions.
+_BUILTIN_TO_TYPING = {
+    list: List,
+    dict: Dict,
+    tuple: Tuple,
+    set: Set,
+    frozenset: FrozenSet,
+}
+
+
+def _normalize_type_hint(tp: Any) -> Any:
+    """Convert Python 3.10+ type hints to typing module equivalents.
+
+    Older PyTorch ``infer_schema`` only recognises ``typing.List[int]`` etc.,
+    not the built-in ``list[int]`` generics introduced in Python 3.9/3.10.
+    """
+    # X | Y  (types.UnionType, Python 3.10+)
+    if sys.version_info >= (3, 10) and isinstance(tp, _builtin_types.UnionType):
+        converted = tuple(_normalize_type_hint(a) for a in tp.__args__)
+        return Union[converted]
+
+    # list[X], dict[K,V], tuple[X,...], set[X], frozenset[X]
+    if isinstance(tp, _builtin_types.GenericAlias):
+        origin = tp.__origin__
+        typing_equiv = _BUILTIN_TO_TYPING.get(origin)
+        if typing_equiv is not None:
+            if tp.__args__:
+                converted = tuple(_normalize_type_hint(a) for a in tp.__args__)
+                if len(converted) == 1:
+                    return typing_equiv[converted[0]]
+                return typing_equiv[converted]
+            return typing_equiv
+
+    return tp
+
+
+def _normalize_func_for_schema(func: Callable) -> Callable:
+    """Return *func* (or a thin wrapper) whose ``__annotations__`` use only
+    ``typing``-module generics so that ``torch.library.infer_schema`` can
+    parse them on older PyTorch versions."""
+    annotations = getattr(func, '__annotations__', {})
+    if not annotations:
+        return func
+
+    new_annotations: dict[str, Any] = {}
+    needs_fix = False
+    for key, hint in annotations.items():
+        new_hint = _normalize_type_hint(hint)
+        new_annotations[key] = new_hint
+        if new_hint is not hint:
+            needs_fix = True
+
+    if not needs_fix:
+        return func
+
+    # Create a thin wrapper whose *only* purpose is to carry the fixed
+    # annotations for infer_schema; the real op_func is registered separately.
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    wrapper.__annotations__ = new_annotations
+    return wrapper
+
+
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
@@ -772,7 +842,8 @@ def direct_register_custom_op(
 
         dispatch_key = current_platform.dispatch_key
 
-    schema_str = infer_schema(op_func, mutates_args=mutates_args)
+    schema_str = infer_schema(
+        _normalize_func_for_schema(op_func), mutates_args=mutates_args)
 
     my_lib = target_lib or vllm_lib
     my_lib.define(op_name + schema_str, tags=tags)

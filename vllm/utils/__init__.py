@@ -5,6 +5,32 @@ import uuid
 
 import torch
 
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.collection_utils import flatten_2d_lists
+from vllm.utils.import_utils import LazyLoader
+from vllm.utils.math_utils import cdiv
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import DeviceMemoryProfiler
+from vllm.utils.network_utils import (
+    get_distributed_init_method,
+    get_ip,
+    get_open_port,
+)
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import (
+    STR_DTYPE_TO_TORCH_DTYPE,
+    async_tensor_h2d,
+    cuda_device_count_stateless,
+    current_stream,
+    direct_register_custom_op,
+    get_dtype_size,
+    get_kv_cache_torch_dtype,
+    make_tensor_with_pad,
+    set_random_seed,
+    supports_custom_op,
+    supports_dynamo,
+)
+
 MASK_64_BITS = (1 << 64) - 1
 
 
