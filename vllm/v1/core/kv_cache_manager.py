@@ -212,8 +212,13 @@ class KVCacheManager:
 
         Unlike get_computed_blocks() which does hash-based lookup via
         find_longest_cache_hit(), this directly transfers block references
-        from the parent request. This guarantees:
-        - No eviction race (ref counts are incremented immediately)
+        from the parent request. transfer_blocks() increments ref counts
+        and registers blocks in req_to_blocks for the child. Then
+        allocate_new_computed_blocks() detects the pre-registered blocks
+        and skips its normal touch/registration path.
+
+        Benefits:
+        - No eviction race (ref counts incremented immediately)
         - No hash computation overhead for the shared prefix
         - O(1) per block instead of O(n) hash chain walk
 

@@ -256,7 +256,7 @@ class KVCacheCoordinator(ABC):
             group_blocks = parent_blocks[group_idx]
             inherited = []
             for block in group_blocks:
-                block.incr_ref()
+                block.ref_cnt += 1
                 inherited.append(block)
             manager.req_to_blocks[to_request_id] = inherited
             result.append(inherited)

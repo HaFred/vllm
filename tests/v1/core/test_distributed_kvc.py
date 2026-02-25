@@ -102,7 +102,7 @@ def _allocate_blocks_for_request(
     coordinator, request_id: str, num_blocks: int
 ) -> list[KVCacheBlock]:
     """Manually allocate blocks from the pool and register them for a request."""
-    blocks = coordinator.block_pool.allocate(num_blocks)
+    blocks = coordinator.block_pool.get_new_blocks(num_blocks)
     manager = coordinator.single_type_managers[0]
     manager.req_to_blocks[request_id] = list(blocks)
     return list(blocks)
@@ -117,7 +117,7 @@ class TestTransferBlocks:
     """Tests for KVCacheCoordinator.transfer_blocks()."""
 
     def test_transfer_blocks_basic(self):
-        """Blocks are transferred and ref counts incremented."""
+        """Blocks are transferred, ref counts incremented, and child registered."""
         coordinator = _make_coordinator(enable_caching=False)
         parent_blocks = _allocate_blocks_for_request(
             coordinator, "parent", 3
