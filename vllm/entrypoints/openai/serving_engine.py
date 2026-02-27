@@ -418,20 +418,53 @@ class OpenAIServing:
                     and i == 0
                     and continuation_of is not None
                 ):
-                    task = asyncio.create_task(
-                        collect_from_async_generator(
-                            self.engine_client.generate_continuation(
-                                parent_request_id=continuation_of,
-                                continuation_token_ids=(
-                                    _continuation_suffix_ids or []
-                                ),
-                                sampling_params=beam_search_params,
-                                request_id=request_id_item,
-                                lora_request=lora_req,
-                                trace_headers=trace_headers,
+                    # Wrap in a fallback coroutine: if DKVC continuation
+                    # fails (e.g. parent evicted), fall back to regular
+                    # generate with the full prompt.
+                    async def _try_continuation(
+                        _prompt=individual_prompt,
+                        _params=beam_search_params,
+                        _rid=request_id_item,
+                        _lora=lora_req,
+                        _trace=trace_headers,
+                        _parent=continuation_of,
+                        _suffix=_continuation_suffix_ids,
+                    ):
+                        try:
+                            return await collect_from_async_generator(
+                                self.engine_client.generate_continuation(
+                                    parent_request_id=_parent,
+                                    continuation_token_ids=(
+                                        _suffix or []
+                                    ),
+                                    sampling_params=_params,
+                                    request_id=_rid,
+                                    lora_request=_lora,
+                                    trace_headers=_trace,
+                                )
                             )
-                        )
-                    )
+                        except Exception as exc:
+                            logger.warning(
+                                "DKVC continuation failed for beam "
+                                "search (parent=%s): %s. Falling back "
+                                "to regular generation.",
+                                _parent, exc,
+                            )
+                            # Use a fresh request_id for the fallback
+                            # since the original may be partially
+                            # registered in the output processor.
+                            fb_rid = f"{_rid}-fallback"
+                            return await collect_from_async_generator(
+                                self.engine_client.generate(
+                                    _prompt,
+                                    _params,
+                                    fb_rid,
+                                    lora_request=_lora,
+                                    trace_headers=_trace,
+                                )
+                            )
+
+                    task = asyncio.create_task(_try_continuation())
                 else:
                     task = asyncio.create_task(
                         collect_from_async_generator(
