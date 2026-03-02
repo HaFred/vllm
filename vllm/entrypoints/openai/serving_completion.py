@@ -222,6 +222,15 @@ class OpenAIServingCompletion(OpenAIServing):
                 continuation_suffix = getattr(
                     request, 'continuation_suffix', None
                 )
+                if continuation_of is not None:
+                    logger.info(
+                        "[DKVC] Continuation request detected: "
+                        "request_id=%s, continuation_of=%s, "
+                        "continuation_suffix=%r, beam_search=%s",
+                        request_id, continuation_of,
+                        continuation_suffix,
+                        isinstance(sampling_params, BeamSearchParams),
+                    )
 
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(

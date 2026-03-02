@@ -418,6 +418,13 @@ class OpenAIServing:
                     and i == 0
                     and continuation_of is not None
                 ):
+                    logger.info(
+                        "[DKVC] Beam search using continuation for "
+                        "first beam: request_id=%s, parent=%s, "
+                        "suffix_ids=%s",
+                        request_id_item, continuation_of,
+                        _continuation_suffix_ids,
+                    )
                     # Wrap in a fallback coroutine: if DKVC continuation
                     # fails (e.g. parent evicted), fall back to regular
                     # generate with the full prompt.

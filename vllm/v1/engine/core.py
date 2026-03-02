@@ -708,9 +708,10 @@ class EngineCore:
             # Build the full prompt_token_ids
             suffix = request.continuation_token_ids or []
             request.prompt_token_ids = parent_tokens + suffix
-            logger.debug(
-                "Continuation request %s: inherited %d tokens from parent "
-                "%s, appended %d suffix tokens -> total %d prompt tokens",
+            logger.info(
+                "[DKVC] Continuation request %s: inherited %d tokens from "
+                "parent %s, appended %d suffix tokens -> total %d prompt "
+                "tokens",
                 request.request_id,
                 len(parent_tokens),
                 request.continuation_of,

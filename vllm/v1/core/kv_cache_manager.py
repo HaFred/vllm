@@ -238,9 +238,9 @@ class KVCacheManager:
         )
         if transferred is None:
             # Parent blocks already freed — fall back to hash-based lookup
-            logger.debug(
-                "Parent %s blocks not found, falling back to prefix cache "
-                "for continuation %s",
+            logger.info(
+                "[DKVC] Parent %s blocks not found, falling back to prefix "
+                "cache for continuation %s",
                 parent_request_id,
                 child_request.request_id,
             )
@@ -255,6 +255,16 @@ class KVCacheManager:
         # (need at least 1 token to compute for logits)
         max_cache_hit = child_request.num_tokens - 1
         num_inherited_tokens = min(num_inherited_tokens, max_cache_hit)
+
+        logger.info(
+            "[DKVC] Inherited %d blocks (%d tokens) from parent %s "
+            "for continuation %s (child has %d total tokens)",
+            len(transferred[0]),
+            num_inherited_tokens,
+            parent_request_id,
+            child_request.request_id,
+            child_request.num_tokens,
+        )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
