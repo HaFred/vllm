@@ -5,6 +5,7 @@ import json
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -256,6 +257,12 @@ class OpenAIServing:
         self._async_tokenizer_pool: dict[TokenizerLike, AsyncMicrobatchTokenizer] = {}
         self.log_error_stack = log_error_stack
 
+        # DKVC: bounded cache of beam search results so that a stage-2
+        # continuation can resolve the parent's tokens without EngineCore.
+        # Maps external request_id -> winning beam's full token list.
+        self._beam_token_cache: OrderedDict[str, list[int]] = OrderedDict()
+        self._beam_token_cache_max = 1024
+
         self.input_processor = self.models.input_processor
         self.io_processor = self.models.io_processor
         self.model_config = self.models.model_config
@@ -387,6 +394,46 @@ class OpenAIServing:
             _continuation_suffix_ids = tokenizer.encode(
                 continuation_suffix, add_special_tokens=False
             )
+
+        # DKVC: resolve parent tokens from the API-server token cache.
+        # Beam search sub-requests use ephemeral IDs that EngineCore
+        # cannot map back to the original request_id, so we resolve
+        # the parent here and use regular generate() (APC handles
+        # KV reuse since parent blocks are freed between requests).
+        if continuation_of is not None:
+            parent_tokens = self._beam_token_cache.get(continuation_of)
+            if parent_tokens is not None:
+                suffix = _continuation_suffix_ids or []
+                full_prompt = parent_tokens + suffix
+                prompt_token_ids = full_prompt
+                all_beams = [
+                    BeamSearchSequence(
+                        tokens=full_prompt,
+                        cum_logprob=0,
+                        logprobs=[],
+                        multi_modal_data=multi_modal_data,
+                        mm_processor_kwargs=mm_processor_kwargs,
+                        lora_request=lora_request,
+                    )
+                ]
+                tokenized_length = len(full_prompt)
+                logger.info(
+                    "[DKVC] Resolved parent tokens from beam cache: "
+                    "parent=%s, parent_len=%d, suffix_len=%d, "
+                    "full_prompt_len=%d",
+                    continuation_of, len(parent_tokens),
+                    len(suffix), len(full_prompt),
+                )
+                # Disable generate_continuation — use regular generate
+                # with the full prompt (APC will handle cache reuse).
+                continuation_of = None
+            else:
+                logger.warning(
+                    "[DKVC] Parent %s not found in beam token cache. "
+                    "Will attempt EngineCore lookup via "
+                    "generate_continuation.",
+                    continuation_of,
+                )
 
         is_first_step = True
         for _ in range(max_tokens):
@@ -595,6 +642,19 @@ class OpenAIServing:
             else:
                 tokens = beam.tokens[tokenized_length:]
             beam.text = tokenizer.decode(tokens)
+
+        # DKVC: cache the winning beam's full tokens so a future
+        # continuation request can resolve them without EngineCore.
+        if best_beams:
+            self._beam_token_cache[request_id] = list(best_beams[0].tokens)
+            # Evict oldest entries if over capacity.
+            while len(self._beam_token_cache) > self._beam_token_cache_max:
+                self._beam_token_cache.popitem(last=False)
+            logger.info(
+                "[DKVC] Cached beam result: request_id=%s, "
+                "token_len=%d",
+                request_id, len(best_beams[0].tokens),
+            )
 
         yield RequestOutput(
             request_id=request_id,
