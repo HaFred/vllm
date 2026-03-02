@@ -400,15 +400,37 @@ class OpenAIServing:
         # cannot map back to the original request_id, so we resolve
         # the parent here and use regular generate() (APC handles
         # KV reuse since parent blocks are freed between requests).
+        # The client may send stage 2 before stage 1 completes
+        # (pre-assigned request IDs), so we poll with a timeout.
         if continuation_of is not None:
-            parent_tokens = self._beam_token_cache.get(continuation_of)
-            # Fallback: the client may append a prompt-index suffix
-            # (e.g. "cmpl-xxx-0") but beam_search caches under the
-            # base request_id ("cmpl-xxx").  Strip the last "-N" and retry.
+            def _lookup_parent(cont_id: str) -> list[int] | None:
+                tokens = self._beam_token_cache.get(cont_id)
+                if tokens is not None:
+                    return tokens
+                # Fallback: strip prompt-index suffix ("-0")
+                base_id = cont_id.rsplit("-", 1)[0]
+                if base_id != cont_id:
+                    return self._beam_token_cache.get(base_id)
+                return None
+
+            parent_tokens = _lookup_parent(continuation_of)
             if parent_tokens is None:
-                base_id = continuation_of.rsplit("-", 1)[0]
-                if base_id != continuation_of:
-                    parent_tokens = self._beam_token_cache.get(base_id)
+                logger.info(
+                    "[DKVC] Parent %s not yet in beam cache, "
+                    "waiting up to 120s for stage-1 to finish...",
+                    continuation_of,
+                )
+                for _wait_i in range(600):  # 600 * 0.2s = 120s
+                    await asyncio.sleep(0.2)
+                    parent_tokens = _lookup_parent(continuation_of)
+                    if parent_tokens is not None:
+                        logger.info(
+                            "[DKVC] Parent %s appeared in cache "
+                            "after ~%.1fs",
+                            continuation_of, (_wait_i + 1) * 0.2,
+                        )
+                        break
+
             if parent_tokens is not None:
                 suffix = _continuation_suffix_ids or []
                 full_prompt = parent_tokens + suffix
@@ -436,9 +458,9 @@ class OpenAIServing:
                 continuation_of = None
             else:
                 logger.warning(
-                    "[DKVC] Parent %s not found in beam token cache. "
-                    "Will attempt EngineCore lookup via "
-                    "generate_continuation.",
+                    "[DKVC] Parent %s not found in beam token cache "
+                    "after timeout. Will attempt EngineCore lookup "
+                    "via generate_continuation.",
                     continuation_of,
                 )
 
