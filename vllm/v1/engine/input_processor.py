@@ -633,7 +633,7 @@ class InputProcessor:
             arrival_time = time.time()
 
         sampling_params = params.clone()
-        eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
+        eos_token_id = self.input_preprocessor.get_eos_token_id()
         if sampling_params.max_tokens is None:
             sampling_params.max_tokens = self.model_config.max_model_len
         sampling_params.update_from_generation_config(
@@ -644,7 +644,7 @@ class InputProcessor:
 
         return EngineCoreRequest(
             request_id=request_id,
-            prompt_token_ids=None,  # filled by EngineCore from parent
+            prompt_token_ids=[],  # placeholder; filled by EngineCore from parent
             mm_features=None,
             sampling_params=sampling_params,
             pooling_params=None,
