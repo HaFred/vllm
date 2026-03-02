@@ -5,6 +5,7 @@ import json
 import sys
 import time
 import traceback
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -256,6 +257,12 @@ class OpenAIServing:
         self._async_tokenizer_pool: dict[TokenizerLike, AsyncMicrobatchTokenizer] = {}
         self.log_error_stack = log_error_stack
 
+        # DKVC: bounded cache of beam search results so that a stage-2
+        # continuation can resolve the parent's tokens without EngineCore.
+        # Maps external request_id -> winning beam's full token list.
+        self._beam_token_cache: OrderedDict[str, list[int]] = OrderedDict()
+        self._beam_token_cache_max = 1024
+
         self.input_processor = self.models.input_processor
         self.io_processor = self.models.io_processor
         self.model_config = self.models.model_config
@@ -312,6 +319,8 @@ class OpenAIServing:
         params: BeamSearchParams,
         lora_request: LoRARequest | None = None,
         trace_headers: Mapping[str, str] | None = None,
+        continuation_of: str | None = None,
+        continuation_suffix: str | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         beam_width = params.beam_width
         max_tokens = params.max_tokens
@@ -379,6 +388,83 @@ class OpenAIServing:
         ]
         completed = []
 
+        # Tokenise the continuation suffix once for the first step.
+        _continuation_suffix_ids: list[int] | None = None
+        if continuation_of is not None and continuation_suffix is not None:
+            _continuation_suffix_ids = tokenizer.encode(
+                continuation_suffix, add_special_tokens=False
+            )
+
+        # DKVC: resolve parent tokens from the API-server token cache.
+        # Beam search sub-requests use ephemeral IDs that EngineCore
+        # cannot map back to the original request_id, so we resolve
+        # the parent here and use regular generate() (APC handles
+        # KV reuse since parent blocks are freed between requests).
+        # The client may send stage 2 before stage 1 completes
+        # (pre-assigned request IDs), so we poll with a timeout.
+        if continuation_of is not None:
+            def _lookup_parent(cont_id: str) -> list[int] | None:
+                tokens = self._beam_token_cache.get(cont_id)
+                if tokens is not None:
+                    return tokens
+                # Fallback: strip prompt-index suffix ("-0")
+                base_id = cont_id.rsplit("-", 1)[0]
+                if base_id != cont_id:
+                    return self._beam_token_cache.get(base_id)
+                return None
+
+            parent_tokens = _lookup_parent(continuation_of)
+            if parent_tokens is None:
+                logger.info(
+                    "[DKVC] Parent %s not yet in beam cache, "
+                    "waiting up to 120s for stage-1 to finish...",
+                    continuation_of,
+                )
+                for _wait_i in range(600):  # 600 * 0.2s = 120s
+                    await asyncio.sleep(0.2)
+                    parent_tokens = _lookup_parent(continuation_of)
+                    if parent_tokens is not None:
+                        logger.info(
+                            "[DKVC] Parent %s appeared in cache "
+                            "after ~%.1fs",
+                            continuation_of, (_wait_i + 1) * 0.2,
+                        )
+                        break
+
+            if parent_tokens is not None:
+                suffix = _continuation_suffix_ids or []
+                full_prompt = parent_tokens + suffix
+                prompt_token_ids = full_prompt
+                all_beams = [
+                    BeamSearchSequence(
+                        tokens=full_prompt,
+                        cum_logprob=0,
+                        logprobs=[],
+                        multi_modal_data=multi_modal_data,
+                        mm_processor_kwargs=mm_processor_kwargs,
+                        lora_request=lora_request,
+                    )
+                ]
+                tokenized_length = len(full_prompt)
+                logger.info(
+                    "[DKVC] Resolved parent tokens from beam cache: "
+                    "parent=%s, parent_len=%d, suffix_len=%d, "
+                    "full_prompt_len=%d",
+                    continuation_of, len(parent_tokens),
+                    len(suffix), len(full_prompt),
+                )
+                # Disable generate_continuation — use regular generate
+                # with the full prompt (APC will handle cache reuse).
+                continuation_of = None
+            else:
+                logger.warning(
+                    "[DKVC] Parent %s not found in beam token cache "
+                    "after timeout. Will attempt EngineCore lookup "
+                    "via generate_continuation.",
+                    continuation_of,
+                )
+
+        is_first_step = True
         for _ in range(max_tokens):
             prompts_batch, lora_req_batch = zip(
                 *[
@@ -401,18 +487,82 @@ class OpenAIServing:
                 zip(prompts_batch, lora_req_batch)
             ):
                 request_id_item = f"{request_id_batch}-beam-{i}"
-                task = asyncio.create_task(
-                    collect_from_async_generator(
-                        self.engine_client.generate(
-                            individual_prompt,
-                            beam_search_params,
-                            request_id_item,
-                            lora_request=lora_req,
-                            trace_headers=trace_headers,
+
+                # First step, first beam: use continuation to inherit KVC
+                if (
+                    is_first_step
+                    and i == 0
+                    and continuation_of is not None
+                ):
+                    logger.info(
+                        "[DKVC] Beam search using continuation for "
+                        "first beam: request_id=%s, parent=%s, "
+                        "suffix_ids=%s",
+                        request_id_item, continuation_of,
+                        _continuation_suffix_ids,
+                    )
+                    # Wrap in a fallback coroutine: if DKVC continuation
+                    # fails (e.g. parent evicted), fall back to regular
+                    # generate with the full prompt.
+                    async def _try_continuation(
+                        _prompt=individual_prompt,
+                        _params=beam_search_params,
+                        _rid=request_id_item,
+                        _lora=lora_req,
+                        _trace=trace_headers,
+                        _parent=continuation_of,
+                        _suffix=_continuation_suffix_ids,
+                    ):
+                        try:
+                            return await collect_from_async_generator(
+                                self.engine_client.generate_continuation(
+                                    parent_request_id=_parent,
+                                    continuation_token_ids=(
+                                        _suffix or []
+                                    ),
+                                    sampling_params=_params,
+                                    request_id=_rid,
+                                    lora_request=_lora,
+                                    trace_headers=_trace,
+                                )
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "DKVC continuation failed for beam "
+                                "search (parent=%s): %s. Falling back "
+                                "to regular generation.",
+                                _parent, exc,
+                            )
+                            # Use a fresh request_id for the fallback
+                            # since the original may be partially
+                            # registered in the output processor.
+                            fb_rid = f"{_rid}-fallback"
+                            return await collect_from_async_generator(
+                                self.engine_client.generate(
+                                    _prompt,
+                                    _params,
+                                    fb_rid,
+                                    lora_request=_lora,
+                                    trace_headers=_trace,
+                                )
+                            )
+
+                    task = asyncio.create_task(_try_continuation())
+                else:
+                    task = asyncio.create_task(
+                        collect_from_async_generator(
+                            self.engine_client.generate(
+                                individual_prompt,
+                                beam_search_params,
+                                request_id_item,
+                                lora_request=lora_req,
+                                trace_headers=trace_headers,
+                            )
                         )
                     )
-                )
                 tasks.append(task)
+
+            is_first_step = False
 
             output = [x[0] for x in await asyncio.gather(*tasks)]
 
@@ -521,6 +671,19 @@ class OpenAIServing:
             else:
                 tokens = beam.tokens[tokenized_length:]
             beam.text = tokenizer.decode(tokens)
+
+        # DKVC: cache the winning beam's full tokens so a future
+        # continuation request can resolve them without EngineCore.
+        if best_beams:
+            self._beam_token_cache[request_id] = list(best_beams[0].tokens)
+            # Evict oldest entries if over capacity.
+            while len(self._beam_token_cache) > self._beam_token_cache_max:
+                self._beam_token_cache.popitem(last=False)
+            logger.info(
+                "[DKVC] Cached beam result: request_id=%s, "
+                "token_len=%d",
+                request_id, len(best_beams[0].tokens),
+            )
 
         yield RequestOutput(
             request_id=request_id,

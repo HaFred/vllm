@@ -1154,6 +1154,25 @@ class CompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    continuation_of: str | None = Field(
+        default=None,
+        description=(
+            "If set, this request is a continuation of the specified parent "
+            "request. The engine will inherit the parent's KV cache blocks "
+            "directly, skipping re-tokenisation and re-prefill of the shared "
+            "prefix. Only the continuation_suffix tokens need to be prefilled."
+        ),
+    )
+    continuation_suffix: str | None = Field(
+        default=None,
+        description=(
+            "Text to append after the parent request's output when using "
+            "continuation_of. This small suffix is tokenised server-side. "
+            "The full prompt becomes: parent's all_token_ids + "
+            "tokenize(continuation_suffix)."
+        ),
+    )
+
     vllm_xargs: dict[str, str | int | float] | None = Field(
         default=None,
         description=(

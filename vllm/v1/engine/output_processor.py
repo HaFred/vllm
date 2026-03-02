@@ -127,9 +127,15 @@ class RequestState:
         self.prompt = prompt
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
-        self.prompt_len = length_from_prompt_token_ids_or_embeds(
-            self.prompt_token_ids, self.prompt_embeds
-        )
+        # For continuation requests, prompt_token_ids is None at this point
+        # (populated later by EngineCore from the parent's tokens).
+        # Defer prompt_len; it will be set via update_prompt_token_ids().
+        if prompt_token_ids is None and prompt_embeds is None:
+            self.prompt_len = 0
+        else:
+            self.prompt_len = length_from_prompt_token_ids_or_embeds(
+                self.prompt_token_ids, self.prompt_embeds
+            )
         self.logprobs_processor = logprobs_processor
         self.detokenizer = detokenizer
         self.max_tokens_param = max_tokens_param

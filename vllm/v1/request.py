@@ -44,9 +44,11 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        continuation_of: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
+        self.continuation_of = continuation_of
         self.priority = priority
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
@@ -158,6 +160,7 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            continuation_of=getattr(request, 'continuation_of', None),
         )
 
     def append_output_token_ids(

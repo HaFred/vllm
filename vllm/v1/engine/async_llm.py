@@ -480,6 +480,86 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s failed due to %s.", request_id, s)
             raise EngineGenerateError() from e
 
+    async def generate_continuation(
+        self,
+        parent_request_id: str,
+        continuation_token_ids: list[int],
+        sampling_params: SamplingParams,
+        request_id: str,
+        *,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Generate continuing from a parent request's KV cache.
+
+        The child request inherits the parent's KV cache blocks directly,
+        skipping re-tokenisation and re-prefill of the shared prefix.
+        Only the continuation_token_ids suffix needs to be prefilled.
+
+        Args:
+            parent_request_id: The request_id of the completed stage-1
+                request (the internal request_id, not the external one).
+            continuation_token_ids: Token IDs to append after the parent's
+                output (e.g., tokenized "</think>\\n<|sid_begin|>").
+            sampling_params: Sampling parameters for the continuation.
+            request_id: Unique ID for this continuation request.
+        """
+        # Build an EngineCoreRequest that skips tokenisation
+        request = self.input_processor.process_continuation(
+            request_id=request_id,
+            parent_request_id=parent_request_id,
+            continuation_token_ids=continuation_token_ids,
+            params=sampling_params,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+        )
+
+        # From here, same flow as generate() — add_request accepts
+        # EngineCoreRequest directly and skips re-processing.
+        q: RequestOutputCollector | None = None
+        try:
+            q = await self.add_request(
+                request_id,
+                request,  # pass EngineCoreRequest directly
+                sampling_params,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+            )
+
+            finished = False
+            while not finished:
+                out = q.get_nowait() or await q.get()
+                finished = out.finished
+                assert isinstance(out, RequestOutput)
+                yield out
+
+        except (asyncio.CancelledError, GeneratorExit):
+            if q is not None:
+                await self.abort(q.request_id, internal=True)
+            if self.log_requests:
+                logger.info("Continuation request %s aborted.", request_id)
+            raise
+        except EngineDeadError:
+            if self.log_requests:
+                logger.info("Continuation request %s failed (engine dead).",
+                            request_id)
+            raise
+        except ValueError:
+            raise
+        except Exception as e:
+            if q is not None:
+                await self.abort(q.request_id, internal=True)
+            if self.log_requests:
+                logger.info("Continuation request %s failed: %s.",
+                            request_id, e)
+            raise EngineGenerateError() from e
+
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
 

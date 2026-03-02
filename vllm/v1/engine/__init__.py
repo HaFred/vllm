@@ -82,6 +82,13 @@ class EngineCoreRequest(
     # Used in outputs and to support abort(req_id, internal=False).
     external_req_id: str | None = None
 
+    # Continuation support: inherit KV cache from a parent request.
+    # When set, the engine constructs prompt_token_ids from the parent's
+    # all_token_ids + continuation_token_ids, and the scheduler inherits
+    # KV cache blocks directly instead of doing hash-based prefix lookup.
+    continuation_of: str | None = None
+    continuation_token_ids: list[int] | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

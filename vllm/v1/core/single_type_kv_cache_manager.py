@@ -158,7 +158,12 @@ class SingleTypeKVCacheManager(ABC):
 
         # A new request.
         req_blocks = self.req_to_blocks[request_id]
-        assert len(req_blocks) == 0
+        if len(req_blocks) > 0:
+            # Blocks already registered by transfer_blocks (DKVC continuation).
+            # Ref counts were incremented there; just record cached-block count.
+            self.num_cached_block[request_id] = len(req_blocks)
+            return
+
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
         )

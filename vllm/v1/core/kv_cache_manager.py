@@ -203,6 +203,79 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def inherit_blocks_from_parent(
+        self,
+        child_request: Request,
+        parent_request_id: str,
+    ) -> tuple[KVCacheBlocks, int]:
+        """Directly inherit KV cache blocks from a parent request.
+
+        Unlike get_computed_blocks() which does hash-based lookup via
+        find_longest_cache_hit(), this directly transfers block references
+        from the parent request. transfer_blocks() increments ref counts
+        and registers blocks in req_to_blocks for the child. Then
+        allocate_new_computed_blocks() detects the pre-registered blocks
+        and skips its normal touch/registration path.
+
+        Benefits:
+        - No eviction race (ref counts incremented immediately)
+        - No hash computation overhead for the shared prefix
+        - O(1) per block instead of O(n) hash chain walk
+
+        Falls back to get_computed_blocks() if the parent's blocks are
+        no longer available (e.g., parent was freed and blocks evicted).
+
+        Args:
+            child_request: The continuation request.
+            parent_request_id: The request_id of the parent.
+
+        Returns:
+            A tuple of (inherited_blocks, num_inherited_tokens).
+        """
+        transferred = self.coordinator.transfer_blocks(
+            from_request_id=parent_request_id,
+            to_request_id=child_request.request_id,
+        )
+        if transferred is None:
+            # Parent blocks already freed — fall back to hash-based lookup
+            logger.info(
+                "[DKVC] Parent %s blocks not found, falling back to prefix "
+                "cache for continuation %s",
+                parent_request_id,
+                child_request.request_id,
+            )
+            return self.get_computed_blocks(child_request)
+
+        # Compute the number of inherited tokens from the first group's blocks.
+        # Get block_size from the first kv_cache_group's spec.
+        block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        num_inherited_tokens = len(transferred[0]) * block_size
+
+        # Don't exceed child's prompt length - 1
+        # (need at least 1 token to compute for logits)
+        max_cache_hit = child_request.num_tokens - 1
+        num_inherited_tokens = min(num_inherited_tokens, max_cache_hit)
+
+        logger.info(
+            "[DKVC] Inherited %d blocks (%d tokens) from parent %s "
+            "for continuation %s (child has %d total tokens)",
+            len(transferred[0]),
+            num_inherited_tokens,
+            parent_request_id,
+            child_request.request_id,
+            child_request.num_tokens,
+        )
+
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.record(
+                num_tokens=child_request.num_tokens,
+                num_hits=num_inherited_tokens,
+                preempted=False,
+            )
+
+        return self.create_kv_cache_blocks(transferred), num_inherited_tokens
+
     def allocate_slots(
         self,
         request: Request,

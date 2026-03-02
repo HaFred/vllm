@@ -516,10 +516,19 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    if getattr(request, 'continuation_of', None) is not None:
+                        # Continuation request: inherit blocks directly
+                        # from the parent instead of hash-based lookup.
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.inherit_blocks_from_parent(
+                                request, request.continuation_of
+                            )
+                        )
+                    else:
+                        # Get locally-cached tokens.
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(request)
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

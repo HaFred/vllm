@@ -60,6 +60,26 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    def generate_continuation(
+        self,
+        parent_request_id: str,
+        continuation_token_ids: list[int],
+        sampling_params: SamplingParams,
+        request_id: str,
+        *,
+        lora_request: LoRARequest | None = None,
+        trace_headers: Mapping[str, str] | None = None,
+        priority: int = 0,
+        data_parallel_rank: int | None = None,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Generate continuing from a parent request's KV cache.
+
+        The child request inherits the parent's KV cache blocks directly,
+        skipping re-tokenisation and re-prefill of the shared prefix.
+        """
+        ...
+
+    @abstractmethod
     def encode(
         self,
         prompt: PromptType,
