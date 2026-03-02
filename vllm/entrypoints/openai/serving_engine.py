@@ -402,6 +402,13 @@ class OpenAIServing:
         # KV reuse since parent blocks are freed between requests).
         if continuation_of is not None:
             parent_tokens = self._beam_token_cache.get(continuation_of)
+            # Fallback: the client may append a prompt-index suffix
+            # (e.g. "cmpl-xxx-0") but beam_search caches under the
+            # base request_id ("cmpl-xxx").  Strip the last "-N" and retry.
+            if parent_tokens is None:
+                base_id = continuation_of.rsplit("-", 1)[0]
+                if base_id != continuation_of:
+                    parent_tokens = self._beam_token_cache.get(base_id)
             if parent_tokens is not None:
                 suffix = _continuation_suffix_ids or []
                 full_prompt = parent_tokens + suffix
