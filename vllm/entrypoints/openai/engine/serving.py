@@ -297,10 +297,14 @@ class OpenAIServing:
         sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
 
         logprobs_num = 2 * beam_width
+        extra_args = None
+        if params.kv_transfer_params:
+            extra_args = {"kv_transfer_params": params.kv_transfer_params}
         beam_search_params = SamplingParams(
             logprobs=logprobs_num,
             max_tokens=1,
             temperature=temperature,
+            extra_args=extra_args,
         )
         all_beams = [
             BeamSearchSequence(
