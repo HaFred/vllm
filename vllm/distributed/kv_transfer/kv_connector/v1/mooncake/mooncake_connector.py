@@ -250,6 +250,7 @@ class MooncakeConnectorScheduler:
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self.vllm_config = vllm_config
+        self.block_size = vllm_config.cache_config.block_size
 
         assert vllm_config.kv_transfer_config
         self.is_kv_producer: bool = (
@@ -302,8 +303,28 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             assert not self.is_kv_producer
             token_ids = request.prompt_token_ids or []
-            count = len(token_ids) - num_computed_tokens
+            remote_cap = params.get("num_remote_tokens")
+            if remote_cap is not None:
+                count = min(len(token_ids), remote_cap) - num_computed_tokens
+                if count <= self.block_size:
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] get_num_new_matched_tokens: "
+                        "SKIP remote prefill req=%s count=%d <= block_size=%d "
+                        "(tokens=%d remote_cap=%d computed=%d)",
+                        request.request_id, count, self.block_size,
+                        len(token_ids), remote_cap, num_computed_tokens,
+                    )
+                    return 0, False
+            else:
+                count = len(token_ids) - num_computed_tokens
             if count > 0:
+                logger.info(
+                    "[KV_TRANSFER_PROOF] get_num_new_matched_tokens: "
+                    "WILL do remote prefill req=%s count=%d "
+                    "(tokens=%d remote_cap=%s computed=%d)",
+                    request.request_id, count,
+                    len(token_ids), remote_cap, num_computed_tokens,
+                )
                 return count, True
 
         # No remote prefill for this request.
@@ -313,6 +334,16 @@ class MooncakeConnectorScheduler:
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         params = request.kv_transfer_params
+
+        # Unconditional proof log
+        logger.info(
+            "[KV_TRANSFER_PROOF] update_state_after_alloc: req_id=%s "
+            "kv_transfer_params=%s num_external_tokens=%d "
+            "is_producer=%s is_consumer=%s",
+            request.request_id, params, num_external_tokens,
+            self.is_kv_producer, self.is_kv_consumer,
+        )
+
         logger.debug(
             "MooncakeConnector update_state_after_alloc: "
             "req_id=%s num_external_tokens=%s, kv_transfer_params=%s",
@@ -336,8 +367,31 @@ class MooncakeConnectorScheduler:
                 local_block_ids = (
                     blocks.get_unhashed_block_ids() if num_external_tokens > 0 else []
                 )
-                # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
+                if num_external_tokens > 0 or local_block_ids:
+                    # Get unhashed blocks to pull from remote.
+                    self._reqs_need_recv[request.request_id] = (
+                        request, local_block_ids,
+                    )
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] Stage 2 will fetch KV: req_id=%s "
+                        "transfer_id=%s external_tokens=%d local_blocks=%d",
+                        request.request_id, params.get("transfer_id"),
+                        num_external_tokens, len(local_block_ids),
+                    )
+                else:
+                    # Beam sibling or full prefix-cache hit where the
+                    # primary request already completed the KV transfer.
+                    # Do NOT queue into _reqs_need_recv — the producer
+                    # already tracks this via completed_transfers and the
+                    # scheduler will remove the request before the
+                    # async recv round-trip finishes, causing an
+                    # AssertionError in _update_from_kv_xfer_finished.
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] Stage 2 SKIP recv queue: "
+                        "req_id=%s transfer_id=%s external_tokens=0 "
+                        "local_blocks=0 (beam sibling / prefix hit)",
+                        request.request_id, params.get("transfer_id"),
+                    )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
@@ -373,6 +427,13 @@ class MooncakeConnectorScheduler:
             self._reqs_need_recv.clear()
 
         if not self.is_kv_consumer:
+            if self._reqs_need_send:
+                logger.info(
+                    "[KV_TRANSFER_PROOF] build_connector_meta: "
+                    "sending %d reqs: %s",
+                    len(self._reqs_need_send),
+                    {rid: len(blk) for rid, (_, blk) in self._reqs_need_send.items()},
+                )
             for req_id, (req, block_ids) in self._reqs_need_send.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
@@ -398,12 +459,13 @@ class MooncakeConnectorScheduler:
         """
 
         params = request.kv_transfer_params
-        logger.debug(
-            "MooncakeConnector request_finished, req_id=%s, request_status=%s, "
-            "kv_transfer_params=%s",
+        logger.info(
+            "[KV_TRANSFER_PROOF] request_finished: req_id=%s status=%s "
+            "kv_transfer_params=%s block_ids=%d",
             request.request_id,
             request.status,
             params,
+            len(block_ids),
         )
         if not params or not params.get("transfer_id"):
             return False, None
@@ -425,9 +487,17 @@ class MooncakeConnectorScheduler:
 
         assert not self.is_kv_consumer
 
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
-            # Also include the case of a P/D Prefill request with immediate
-            # block free (eg abort). Stop tracking this request.
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_ABORTED,
+        ):
+            # Error / ignored requests should not trigger KV transfer —
+            # free blocks immediately and stop tracking.
+            # NOTE: FINISHED_ABORTED is included because streaming clients
+            # may disconnect after reading all tokens but before vLLM
+            # internally marks the request as FINISHED_STOPPED. The KV
+            # blocks are still valid and should be transferred.
             self._reqs_not_processed.add(params["transfer_id"])
             return False, None
 
@@ -437,6 +507,22 @@ class MooncakeConnectorScheduler:
 
         if delay_free_blocks:
             self._reqs_need_send[request.request_id] = (request, block_ids)
+            logger.info(
+                "[KV_TRANSFER_PROOF] request_finished: DELAYING free for "
+                "req_id=%s transfer_id=%s blocks=%d status=%s",
+                request.request_id,
+                params["transfer_id"],
+                len(block_ids),
+                request.status,
+            )
+        else:
+            logger.info(
+                "[KV_TRANSFER_PROOF] request_finished: NO blocks to send "
+                "for req_id=%s transfer_id=%s status=%s",
+                request.request_id,
+                params["transfer_id"],
+                request.status,
+            )
 
         return delay_free_blocks, None
 
@@ -502,6 +588,11 @@ class MooncakeConnectorWorker:
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
+        # Transfer IDs that have already been fully sent and cleaned up.
+        # Used to detect late-arriving duplicate pulls (e.g. beam siblings
+        # whose kv_transfer_params were deserialized with do_remote_prefill
+        # still True).
+        self.completed_transfers: set[TransferId] = set()
 
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
@@ -646,6 +737,11 @@ class MooncakeConnectorWorker:
         try:
             while True:
                 identity, metadata_bytes = await sock.recv_multipart()
+                logger.info(
+                    "[KV_TRANSFER_PROOF] sender_listener: received ZMQ "
+                    "pull request (%d bytes), queue_size=%d",
+                    len(metadata_bytes), self.sender_worker_queue.qsize(),
+                )
                 await self.sender_worker_queue.put((identity, metadata_bytes))
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake sender thread.")
@@ -662,6 +758,11 @@ class MooncakeConnectorWorker:
         while True:
             try:
                 identity, metadata_bytes = await self.sender_worker_queue.get()
+                logger.info(
+                    "[KV_TRANSFER_PROOF] sender_worker: picked up work "
+                    "(%d bytes), remaining_queue=%d",
+                    len(metadata_bytes), self.sender_worker_queue.qsize(),
+                )
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
                     await self.send_kv_to_decode(identity, sock, metadata)
@@ -695,8 +796,24 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
+        transfer_status = {}
+        already_done_reqs: list[ReqId] = []
         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
+            in_store = transfer_id in self.reqs_need_send
+            is_ready = self.reqs_need_send[transfer_id].ready.is_set() if in_store else None
+            completed = transfer_id in self.completed_transfers
+            transfer_status[transfer_id] = {
+                "in_store": in_store, "ready": is_ready, "completed": completed,
+            }
             if transfer_id not in self.reqs_need_send:
+                if transfer_id in self.completed_transfers:
+                    # Transfer already completed and cleaned up (e.g. beam
+                    # sibling whose kv_transfer_params still had
+                    # do_remote_prefill=True due to serialization copy).
+                    # The D already has the KV data from the first pull.
+                    # Skip this request — it will be reported as ok.
+                    already_done_reqs.append(d_req_id)
+                    continue
                 # This req is not enqueued in P side yet, create it here.
                 self.reqs_need_send[transfer_id] = SendBlockMeta(
                     p_req_id="",
@@ -706,6 +823,21 @@ class MooncakeConnectorWorker:
                 )
             send_meta = self.reqs_need_send[transfer_id]
             pending_reqs[d_req_id] = send_meta
+
+        logger.info(
+            "[KV_TRANSFER_PROOF] send_kv_to_decode: transfer_status=%s "
+            "pending_reqs=%d already_done=%d",
+            transfer_status, len(pending_reqs), len(already_done_reqs),
+        )
+
+        # If all requests were already completed, respond immediately.
+        if not pending_reqs:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=already_done_reqs,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
@@ -810,12 +942,15 @@ class MooncakeConnectorWorker:
                 send_meta.sent += 1
                 if send_meta.sent == send_meta.need_send:
                     del self.reqs_need_send[send_meta.transfer_id]
+                    self.completed_transfers.add(send_meta.transfer_id)
                     self.finished_sending_reqs.add(send_meta.p_req_id)
 
             response = MooncakeXferResponse(
                 status=response_status,
-                ok_reqs=[d_req_id for d_req_id, _ in ready_reqs],
+                ok_reqs=[d_req_id for d_req_id, _ in ready_reqs] + already_done_reqs,
             )
+            # Only include already_done_reqs in the first response.
+            already_done_reqs = []
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
     def resolve_need_send(self, send_meta: SendBlockMeta, remote_tp_ranks: list[int]):
@@ -1001,6 +1136,33 @@ class MooncakeConnectorWorker:
 
         for transfer_id in expired_transfer_id:
             del self.reqs_need_send[transfer_id]
+            self.completed_transfers.add(transfer_id)
+
+        # Log KV transfer pipeline status each tick.
+        if self.reqs_need_send or finished_sending_reqs:
+            waiting = 0
+            ready = 0
+            inflight = 0
+            total_blocks_held = 0
+            for sm in self.reqs_need_send.values():
+                total_blocks_held += len(sm.local_block_ids)
+                if sm.sending > 0:
+                    inflight += 1
+                elif sm.ready.is_set():
+                    ready += 1
+                else:
+                    waiting += 1
+            logger.info(
+                "[KV_TRANSFER_PROOF] xfer_pipeline_tick: "
+                "finished_this_tick=%d remaining=%d "
+                "(waiting=%d ready=%d inflight=%d) "
+                "blocks_held_for_xfer=%d expired=%d",
+                len(finished_sending_reqs),
+                len(self.reqs_need_send),
+                waiting, ready, inflight,
+                total_blocks_held,
+                len(expired_transfer_id),
+            )
 
         return finished_sending_reqs
 
@@ -1042,6 +1204,11 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         req_ids = set(pull_metas)
+        logger.info(
+            "[KV_TRANSFER_PROOF] receive_kv_from_single_worker: "
+            "connecting to %s for reqs=%s",
+            worker_addr, req_ids,
+        )
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -1072,9 +1239,20 @@ class MooncakeConnectorWorker:
                     zmq.RCVTIMEO, (envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT + 60) * 1000
                 )
                 await sock.send(encoded_data)
+                logger.info(
+                    "[KV_TRANSFER_PROOF] zmq_sent: reqs=%s to %s "
+                    "(%d bytes), awaiting response...",
+                    req_ids, worker_addr, len(encoded_data),
+                )
                 while True:
                     ret_msg = await sock.recv()
                     response = self._xfer_resp_decoder.decode(ret_msg)
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] zmq_recv: reqs=%s "
+                        "status=%s ok=%s err=%s",
+                        req_ids, response.status.name,
+                        response.ok_reqs, response.err_reqs,
+                    )
                     if response.status == MooncakeXferResponseStatus.ERROR:
                         logger.error(
                             "Error happens during tranfering kvcache for %s: %s",
@@ -1088,7 +1266,10 @@ class MooncakeConnectorWorker:
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
         except Exception as e:
-            logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
+            logger.error(
+                "[KV_TRANSFER_PROOF] zmq_error: reqs=%s addr=%s err=%s",
+                req_ids, worker_addr, e,
+            )
             return
 
     def process_pulling_result(
@@ -1104,6 +1285,12 @@ class MooncakeConnectorWorker:
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
+                logger.info(
+                    "[KV_TRANSFER_PROOF] KV received: req_id=%s "
+                    "transfer_id=%s blocks=%d",
+                    pull_meta.d_req_id, pull_meta.transfer_id,
+                    len(pull_meta.local_block_ids),
+                )
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
@@ -1161,6 +1348,12 @@ class MooncakeConnectorWorker:
             pull_meta.pull_tasks_count = count
         for remote_tp_rank in remote_tp_ranks:
             worker_addr = self._remote_agents[remote_engine_id][remote_tp_rank][0]
+            logger.info(
+                "[KV_TRANSFER_PROOF] receive_kv: creating pull task "
+                "engine=%s tp_rank=%d addr=%s reqs=%s",
+                remote_engine_id, remote_tp_rank, worker_addr,
+                list(pull_metas.keys()),
+            )
             asyncio.create_task(
                 self.receive_kv_from_single_worker(worker_addr, pull_metas)
             )
@@ -1191,6 +1384,13 @@ class MooncakeConnectorWorker:
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
         for remote_engine_id, pull_metas in reqs_to_recv.items():
+            logger.info(
+                "[KV_TRANSFER_PROOF] _start_load_kv: engine=%s "
+                "reqs=%s known_remote=%s",
+                remote_engine_id,
+                list(pull_metas.keys()),
+                remote_engine_id in self._remote_agents,
+            )
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
                     self.handle_new_engine_id(remote_engine_id, pull_metas)
@@ -1202,13 +1402,41 @@ class MooncakeConnectorWorker:
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
-                send_meta = self.reqs_need_send[transfer_id]
-                send_meta.p_req_id = p_req_id
-                send_meta.local_block_ids = block_ids
-                send_meta.expire_time = (
-                    time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
-                )
-                send_meta.ready.set()
+                if transfer_id not in self.reqs_need_send:
+                    # Entry not yet created (request finished before the
+                    # first empty-block_ids pass was processed). Create it
+                    # now and mark ready immediately.
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] record_send_reqs: creating "
+                        "new entry for transfer_id=%s with %d blocks "
+                        "(fast-path: request finished before first pass)",
+                        transfer_id, len(block_ids),
+                    )
+                    self.reqs_need_send[transfer_id] = SendBlockMeta(
+                        p_req_id=p_req_id,
+                        transfer_id=transfer_id,
+                        local_block_ids=block_ids,
+                        ready=asyncio.Event(),
+                        expire_time=(
+                            time.perf_counter()
+                            + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                        ),
+                    )
+                    self.reqs_need_send[transfer_id].ready.set()
+                else:
+                    send_meta = self.reqs_need_send[transfer_id]
+                    send_meta.p_req_id = p_req_id
+                    send_meta.local_block_ids = block_ids
+                    send_meta.expire_time = (
+                        time.perf_counter()
+                        + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                    )
+                    send_meta.ready.set()
+                    logger.debug(
+                        "[KV_TRANSFER_PROOF] record_send_reqs: set ready "
+                        "for transfer_id=%s with %d blocks",
+                        transfer_id, len(block_ids),
+                    )
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet
@@ -1224,10 +1452,36 @@ class MooncakeConnectorWorker:
         for transfer_id in metadata.reqs_not_processed:
             send_meta = self.reqs_need_send.pop(transfer_id)
             if send_meta:
+                self.completed_transfers.add(transfer_id)
                 assert not send_meta.ready.is_set()
+
+        # Expose KV store / transferable status after processing.
+        if self.reqs_need_send:
+            waiting = 0    # enqueued but not ready (blocks not assigned yet)
+            ready = 0      # ready to send (blocks assigned, awaiting D pull)
+            sending = 0    # actively being transferred
+            for sm in self.reqs_need_send.values():
+                if sm.sending > 0:
+                    sending += 1
+                elif sm.ready.is_set():
+                    ready += 1
+                else:
+                    waiting += 1
+            logger.info(
+                "[KV_TRANSFER_PROOF] kv_store_status: "
+                "total_queued=%d waiting=%d ready=%d sending=%d "
+                "total_blocks_held=%d",
+                len(self.reqs_need_send), waiting, ready, sending,
+                sum(len(sm.local_block_ids) for sm in
+                    self.reqs_need_send.values()),
+            )
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
+            logger.info(
+                "[KV_TRANSFER_PROOF] start_load_kv: fetching KV from %s",
+                {eid: list(reqs.keys()) for eid, reqs in metadata.reqs_to_recv.items()},
+            )
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
             )

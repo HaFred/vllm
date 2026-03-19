@@ -632,3 +632,4 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    kv_transfer_params: dict[str, Any] | None = None

@@ -347,6 +347,19 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # KV Transfer debug: log free block count at tick start.
+        if self.connector is not None:
+            bp = self.kv_cache_manager.block_pool
+            logger.info(
+                "[KV_TRANSFER_PROOF] schedule tick: free_blocks=%d/%d "
+                "usage=%.2f%% running=%d waiting=%d",
+                bp.get_num_free_blocks(),
+                bp.num_gpu_blocks - 1,
+                bp.get_usage() * 100,
+                len(self.running),
+                len(self.waiting),
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1981,6 +1994,8 @@ class Scheduler(SchedulerInterface):
             self.connector.update_connector_output(kv_connector_output)
 
         # KV Connector:: update recv and send status from last step.
+        freed_recv = 0
+        freed_send = 0
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
@@ -1990,10 +2005,23 @@ class Scheduler(SchedulerInterface):
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._free_blocks(self.requests[req_id])
+                freed_recv += 1
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
+            freed_send += 1
+
+        if freed_recv or freed_send:
+            bp = self.kv_cache_manager.block_pool
+            logger.info(
+                "[KV_TRANSFER_PROOF] post_xfer_free: freed_recv=%d "
+                "freed_send=%d free_blocks=%d/%d usage=%.2f%%",
+                freed_recv, freed_send,
+                bp.get_num_free_blocks(),
+                bp.num_gpu_blocks - 1,
+                bp.get_usage() * 100,
+            )
 
     def _update_requests_with_invalid_blocks(
         self,
