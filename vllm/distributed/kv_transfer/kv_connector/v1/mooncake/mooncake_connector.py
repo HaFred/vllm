@@ -367,14 +367,31 @@ class MooncakeConnectorScheduler:
                 local_block_ids = (
                     blocks.get_unhashed_block_ids() if num_external_tokens > 0 else []
                 )
-                # Get unhashed blocks to pull from remote.
-                self._reqs_need_recv[request.request_id] = (request, local_block_ids)
-                logger.info(
-                    "[KV_TRANSFER_PROOF] Stage 2 will fetch KV: req_id=%s "
-                    "transfer_id=%s external_tokens=%d local_blocks=%d",
-                    request.request_id, params.get("transfer_id"),
-                    num_external_tokens, len(local_block_ids),
-                )
+                if num_external_tokens > 0 or local_block_ids:
+                    # Get unhashed blocks to pull from remote.
+                    self._reqs_need_recv[request.request_id] = (
+                        request, local_block_ids,
+                    )
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] Stage 2 will fetch KV: req_id=%s "
+                        "transfer_id=%s external_tokens=%d local_blocks=%d",
+                        request.request_id, params.get("transfer_id"),
+                        num_external_tokens, len(local_block_ids),
+                    )
+                else:
+                    # Beam sibling or full prefix-cache hit where the
+                    # primary request already completed the KV transfer.
+                    # Do NOT queue into _reqs_need_recv — the producer
+                    # already tracks this via completed_transfers and the
+                    # scheduler will remove the request before the
+                    # async recv round-trip finishes, causing an
+                    # AssertionError in _update_from_kv_xfer_finished.
+                    logger.info(
+                        "[KV_TRANSFER_PROOF] Stage 2 SKIP recv queue: "
+                        "req_id=%s transfer_id=%s external_tokens=0 "
+                        "local_blocks=0 (beam sibling / prefix hit)",
+                        request.request_id, params.get("transfer_id"),
+                    )
             else:
                 logger.warning(
                     "Got invalid KVTransferParams: %s. This "
