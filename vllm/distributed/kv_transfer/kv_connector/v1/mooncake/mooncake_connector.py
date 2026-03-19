@@ -571,6 +571,11 @@ class MooncakeConnectorWorker:
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
+        # Transfer IDs that have already been fully sent and cleaned up.
+        # Used to detect late-arriving duplicate pulls (e.g. beam siblings
+        # whose kv_transfer_params were deserialized with do_remote_prefill
+        # still True).
+        self.completed_transfers: set[TransferId] = set()
 
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
@@ -775,13 +780,23 @@ class MooncakeConnectorWorker:
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
         transfer_status = {}
+        already_done_reqs: list[ReqId] = []
         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
             in_store = transfer_id in self.reqs_need_send
             is_ready = self.reqs_need_send[transfer_id].ready.is_set() if in_store else None
+            completed = transfer_id in self.completed_transfers
             transfer_status[transfer_id] = {
-                "in_store": in_store, "ready": is_ready,
+                "in_store": in_store, "ready": is_ready, "completed": completed,
             }
             if transfer_id not in self.reqs_need_send:
+                if transfer_id in self.completed_transfers:
+                    # Transfer already completed and cleaned up (e.g. beam
+                    # sibling whose kv_transfer_params still had
+                    # do_remote_prefill=True due to serialization copy).
+                    # The D already has the KV data from the first pull.
+                    # Skip this request — it will be reported as ok.
+                    already_done_reqs.append(d_req_id)
+                    continue
                 # This req is not enqueued in P side yet, create it here.
                 self.reqs_need_send[transfer_id] = SendBlockMeta(
                     p_req_id="",
@@ -794,9 +809,18 @@ class MooncakeConnectorWorker:
 
         logger.info(
             "[KV_TRANSFER_PROOF] send_kv_to_decode: transfer_status=%s "
-            "pending_reqs=%d",
-            transfer_status, len(pending_reqs),
+            "pending_reqs=%d already_done=%d",
+            transfer_status, len(pending_reqs), len(already_done_reqs),
         )
+
+        # If all requests were already completed, respond immediately.
+        if not pending_reqs:
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=already_done_reqs,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
@@ -901,12 +925,15 @@ class MooncakeConnectorWorker:
                 send_meta.sent += 1
                 if send_meta.sent == send_meta.need_send:
                     del self.reqs_need_send[send_meta.transfer_id]
+                    self.completed_transfers.add(send_meta.transfer_id)
                     self.finished_sending_reqs.add(send_meta.p_req_id)
 
             response = MooncakeXferResponse(
                 status=response_status,
-                ok_reqs=[d_req_id for d_req_id, _ in ready_reqs],
+                ok_reqs=[d_req_id for d_req_id, _ in ready_reqs] + already_done_reqs,
             )
+            # Only include already_done_reqs in the first response.
+            already_done_reqs = []
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
     def resolve_need_send(self, send_meta: SendBlockMeta, remote_tp_ranks: list[int]):
@@ -1092,6 +1119,7 @@ class MooncakeConnectorWorker:
 
         for transfer_id in expired_transfer_id:
             del self.reqs_need_send[transfer_id]
+            self.completed_transfers.add(transfer_id)
 
         # Log KV transfer pipeline status each tick.
         if self.reqs_need_send or finished_sending_reqs:
@@ -1407,6 +1435,7 @@ class MooncakeConnectorWorker:
         for transfer_id in metadata.reqs_not_processed:
             send_meta = self.reqs_need_send.pop(transfer_id)
             if send_meta:
+                self.completed_transfers.add(transfer_id)
                 assert not send_meta.ready.is_set()
 
         # Expose KV store / transferable status after processing.
