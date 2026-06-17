@@ -323,6 +323,19 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+
+    @staticmethod
+    def _debug_print(fmt: str, *args: object) -> None:
+        """Print directly to stderr so messages survive EngineCore subprocess."""
+        import sys
+
+        from vllm.v1.debug import is_vllm_debug_logging_enabled
+
+        if not is_vllm_debug_logging_enabled():
+            return
+        msg = fmt % args if args else fmt
+        print(f"[VLLM_RUNNER] {msg}", file=sys.stderr, flush=True)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1091,6 +1104,15 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+
+        self._debug_print(
+            "_update_states: finished=%d unscheduled=%d new=%d resumed=%d batch_size=%d",
+            len(scheduler_output.finished_req_ids),
+            len(unscheduled_req_ids),
+            len(scheduler_output.scheduled_new_reqs),
+            len(scheduler_output.scheduled_cached_reqs.resumed_req_ids),
+            self.input_batch.num_reqs,
+        )
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -3295,6 +3317,14 @@ class GPUModelRunner(
             )
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        self._debug_print(
+            "execute_model: total_tokens=%d num_reqs_in_sched=%d "
+            "preempted=%d finished=%d",
+            num_scheduled_tokens,
+            len(scheduler_output.num_scheduled_tokens),
+            len(scheduler_output.preempted_req_ids),
+            len(scheduler_output.finished_req_ids),
+        )
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -3325,7 +3355,11 @@ class GPUModelRunner(
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
+                    self._debug_print("execute_model: no tokens scheduled, returning EMPTY")
                     return EMPTY_MODEL_RUNNER_OUTPUT
+                self._debug_print(
+                    "execute_model: no tokens but kv_transfer, using no-forward path"
+                )
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
             if self.cache_config.kv_sharing_fast_prefill:
@@ -3577,6 +3611,11 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        self._debug_print(
+            "execute_model: async path → stored state (logits=%s hidden=%s)",
+            "present" if logits is not None else "none",
+            "present" if hidden_states is not None else "none",
+        )
         return None
 
     @torch.inference_mode
@@ -3589,11 +3628,13 @@ class GPUModelRunner(
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
             if not kv_connector_output:
+                self._debug_print("sample_tokens: no state + no kv_connector → None")
                 return None  # type: ignore[return-value]
 
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
+                self._debug_print("sample_tokens: no state + empty kv_connector → EMPTY")
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
@@ -3615,6 +3656,16 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        self._debug_print(
+            "sample_tokens: num_reqs=%d logits=%s num_logprobs=%d "
+            "num_spec_tokens=%d grammar=%s",
+            self.input_batch.num_reqs,
+            "present" if logits is not None else "none",
+            self.num_prompt_logprobs,
+            self.num_spec_tokens,
+            "present" if grammar_output is not None else "none",
+        )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -3761,6 +3812,11 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        self._debug_print(
+            "sample_tokens done: sampled_tokens=%s num_nans=%s",
+            "present" if async_output.sampled_token_ids is not None else "none",
+            "present" if async_output.num_nans_in_logits else "none",
+        )
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

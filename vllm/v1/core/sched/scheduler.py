@@ -59,8 +59,21 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+from vllm.v1.debug import is_vllm_debug_logging_enabled  # noqa: E402
+
 
 class Scheduler(SchedulerInterface):
+
+    @staticmethod
+    def _debug_print(fmt: str, *args: object) -> None:
+        """Print directly to stderr so messages survive EngineCore subprocess."""
+        import sys
+
+        if not is_vllm_debug_logging_enabled():
+            return
+        msg = fmt % args if args else fmt
+        print(f"[VLLM_SCHED] {msg}", file=sys.stderr, flush=True)
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -338,6 +351,13 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+
+        self._debug_print(
+            "schedule: running=%d waiting=%d token_budget=%d",
+            len(self.running),
+            len(self.waiting),
+            token_budget,
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -887,6 +907,17 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        self._debug_print(
+            "schedule done: scheduled_tokens=%d new=%d cached=%d "
+            "preempted=%d finished=%d elapsed=%.2fms",
+            total_num_scheduled_tokens,
+            len(scheduled_new_reqs),
+            len(scheduled_running_reqs) + len(scheduled_resumed_reqs),
+            len(preempted_reqs),
+            len(self.finished_req_ids),
+            (time.monotonic() - scheduled_timestamp) * 1000,
+        )
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
@@ -1227,6 +1258,11 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._debug_print(
+            "update_from_output: num_scheduled=%d finished_in_output=%d",
+            len(scheduler_output.num_scheduled_tokens),
+            len(scheduler_output.finished_req_ids),
+        )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1470,6 +1506,11 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        self._debug_print(
+            "update_from_output done: output_requests=%d finished_sets=%d",
+            len(outputs),
+            len(finished_req_ids) if finished_req_ids else 0,
+        )
         return engine_core_outputs
 
     def _handle_stopped_request(self, request: Request) -> bool:
@@ -1635,6 +1676,12 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            self._debug_print(
+                "add_request: req=%s prompt_len=%d max_tokens=%d → waiting_queue",
+                request.request_id,
+                request.num_prompt_tokens,
+                request.max_tokens,
+            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str], finished_status: RequestStatus
@@ -1679,6 +1726,12 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             request.status = finished_status
             self._free_request(request)
+            self._debug_print(
+                "finish_requests: req=%s status=%s reason=%s",
+                request.request_id,
+                finished_status.name,
+                request.stop_reason,
+            )
 
     def _free_request(self, request: Request) -> dict[str, Any] | None:
         assert request.is_finished()
